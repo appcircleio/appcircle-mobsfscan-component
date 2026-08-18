@@ -1,0 +1,94 @@
+platform:
+buildPlatform:
+displayName: MobSF Scan
+description: "Runs mobsfscan static analysis on mobile source code"
+inputs:
+- key: "AC_REPOSITORY_DIR"
+  defaultValue: "$AC_REPOSITORY_DIR"
+  isRequired: true
+  title: Repository Directory
+  description: "Specifies the cloned repository directory."
+  helpText:
+- key: "AC_MOBSFSCAN_SOURCE_PATH"
+  defaultValue: "$AC_REPOSITORY_DIR"
+  isRequired: false
+  title: Source Path
+  description: "Path of the source code to scan. A relative value is resolved against the cloned repository directory. Defaults to the repository root."
+  helpText:
+- key: "AC_MOBSFSCAN_SCAN_TYPE"
+  defaultValue: "auto"
+  isRequired: false
+  title: Scan Type
+  description: "Rule set to use: `auto`, `android` or `ios`. `auto` detects the platform from the source code."
+  helpText:
+- key: "AC_MOBSFSCAN_VERSION"
+  defaultValue: "1.0.0"
+  isRequired: true
+  title: mobsfscan Version
+  description: "The `mobsfscan` version to install with pip. Pinned so that builds stay reproducible."
+  helpText:
+- key: "AC_MOBSFSCAN_OUTPUT_FORMATS"
+  defaultValue: "sarif,json"
+  isRequired: false
+  title: Output Formats
+  description: "Comma separated report formats: `sarif`, `json`, `html`, `sonarqube`, `gitlab-sast`. Each format needs its own scan run, so requesting fewer formats is faster."
+  helpText:
+- key: "AC_MOBSFSCAN_SEVERITY_THRESHOLD"
+  defaultValue: "error"
+  isRequired: false
+  title: Severity Threshold
+  description: "Fails the build when a finding at or above this severity is reported: `error`, `warning`, `info` or `none`. `none` is report only. `info` also counts the informational best practice rules, which report on almost every project."
+  helpText:
+- key: "AC_MOBSFSCAN_CONFIG_PATH"
+  isRequired: false
+  title: Config File Path
+  description: "Path of the `.mobsf` YAML config used for rule tuning. A relative value is resolved against the source path. When empty, a `.mobsf` file at the scan root is picked up automatically."
+  helpText:
+- key: "AC_MOBSFSCAN_SAVE_REPORT"
+  defaultValue: "true"
+  isRequired: false
+  title: Save Report
+  description: "Report files will be copied into the artifacts folder if set to true."
+  helpText:
+- key: "AC_MOBSFSCAN_TIMEOUT"
+  defaultValue: "900"
+  isRequired: false
+  title: Scan Timeout
+  description: "Timeout in seconds for a single mobsfscan run. The step terminates the scan and fails when it is exceeded."
+  helpText:
+- key: "AC_MOBSFSCAN_EXTRA_PARAMETERS"
+  isRequired: false
+  title: Scanner Parameters
+  description: "Extra command line parameters for mobsfscan, split with shell word rules and passed as separate arguments. For example `-mp thread`."
+  helpText:
+- key: "AC_MOBSFSCAN_PIP_INDEX_URL"
+  isRequired: false
+  title: Pip Index URL
+  description: "Alternative Python package index to install mobsfscan from. Use this on runners without access to pypi.org. The value is masked in the logs."
+  helpText:
+- key: "AC_MOBSFSCAN_PIP_FIND_LINKS"
+  isRequired: false
+  title: Pip Find Links
+  description: "Directory or URL holding the mobsfscan wheels for an air gapped install. When set, pip runs with `--no-index`."
+  helpText:
+outputs:
+- key: "AC_MOBSFSCAN_JSON_REPORT_PATH"
+  description: "Path of the JSON report, when `json` is a requested output format."
+- key: "AC_MOBSFSCAN_SARIF_REPORT_PATH"
+  description: "Path of the SARIF 2.1.0 report, when `sarif` is a requested output format."
+- key: "AC_MOBSFSCAN_REPORT_DIR"
+  description: "Directory holding the generated reports."
+- key: "AC_MOBSFSCAN_FINDING_COUNT"
+  description: "Total number of findings."
+- key: "AC_MOBSFSCAN_ERROR_COUNT"
+  description: "Number of ERROR severity findings."
+- key: "AC_MOBSFSCAN_WARNING_COUNT"
+  description: "Number of WARNING severity findings."
+- key: "AC_MOBSFSCAN_INFO_COUNT"
+  description: "Number of INFO severity findings."
+- key: "AC_MOBSFSCAN_HIGHEST_SEVERITY"
+  description: "Highest reported severity: `ERROR`, `WARNING`, `INFO` or `NONE`."
+processFilename: ruby
+processArguments: '%AC_STEP_TEMP%/main.rb'
+files:
+- "main.rb"
