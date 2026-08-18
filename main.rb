@@ -1,8 +1,6 @@
-# frozen_string_literal: true
-
 # Appcircle mobsfscan component.
 #
-# Runs mobsfscan (MobSF's source-code SAST engine) against the checked out
+# Runs mobsfscan (MobSF's source code SAST engine) against the checked out
 # repository. mobsfscan is LGPL-3.0-or-later, so it is not redistributed with
 # Appcircle: it is installed at runtime with pip into an isolated virtualenv
 # under AC_STEP_TEMP and discarded when the step ends.
@@ -10,312 +8,434 @@
 # Only Ruby stdlib is used, steps run against the runner's system Ruby without
 # Bundler.
 
-require 'fileutils'
 require 'json'
 require 'open3'
 require 'pathname'
+require 'fileutils'
 require 'shellwords'
+require 'English'
 
-DEFAULT_MOBSFSCAN_VERSION = '1.0.0'
-DEFAULT_OUTPUT_FORMATS = 'sarif,json'
-DEFAULT_SCAN_TYPE = 'auto'
-DEFAULT_SEVERITY_THRESHOLD = 'error'
+###### Defaults & Constants
+DEFAULT_MOBSFSCAN_VERSION = "1.0.0"
+DEFAULT_OUTPUT_FORMATS = "sarif,json"
+DEFAULT_SCAN_TYPE = "auto"
+DEFAULT_SEVERITY_THRESHOLD = "error"
 DEFAULT_SCAN_TIMEOUT = 900
 INSTALL_TIMEOUT = 1800
 VENV_TIMEOUT = 300
+VERSION_TIMEOUT = 120
 
 # mobsfscan 1.0.0 requires Python 3.10+. Older pins accept older interpreters,
-# so a lower version is a warning and pip gets the final say.
-RECOMMENDED_PYTHON = [3, 10].freeze
+# so a lower version is only a warning and pip gets the final say.
+RECOMMENDED_PYTHON = [3, 10]
 
-SEVERITY_RANK = { 'INFO' => 1, 'WARNING' => 2, 'ERROR' => 3 }.freeze
-SEVERITIES = %w[ERROR WARNING INFO].freeze
-THRESHOLDS = %w[none info warning error].freeze
-SCAN_TYPES = %w[auto android ios].freeze
+SEVERITIES = ["ERROR", "WARNING", "INFO"]
+SEVERITY_RANK = {"INFO" => 1, "WARNING" => 2, "ERROR" => 3}
+SEVERITY_THRESHOLDS = ["none", "info", "warning", "error"]
+SCAN_TYPES = ["auto", "android", "ios"]
 
-# mobsfscan takes a single -o, so every format needs its own invocation.
+# mobsfscan takes a single -o, so every output format needs its own run.
 OUTPUT_FORMATS = {
-  'json' => { flag: '--json', filename: 'mobsfscan.json' },
-  'sarif' => { flag: '--sarif', filename: 'mobsfscan.sarif' },
-  'html' => { flag: '--html', filename: 'mobsfscan.html' },
-  'sonarqube' => { flag: '--sonarqube', filename: 'mobsfscan-sonarqube.json' },
-  'gitlab-sast' => { flag: '--gitlab-sast', filename: 'mobsfscan-gitlab-sast.json' }
-}.freeze
+  "json" => {:flag => "--json", :filename => "mobsfscan.json"},
+  "sarif" => {:flag => "--sarif", :filename => "mobsfscan.sarif"},
+  "html" => {:flag => "--html", :filename => "mobsfscan.html"},
+  "sonarqube" => {:flag => "--sonarqube", :filename => "mobsfscan-sonarqube.json"},
+  "gitlab-sast" => {:flag => "--gitlab-sast", :filename => "mobsfscan-gitlab-sast.json"}
+}
 
 NETWORK_ERROR_PATTERNS = [
-  'Temporary failure in name resolution',
-  'Name or service not known',
-  'nodename nor servname provided',
-  'Network is unreachable',
-  'Connection refused',
-  'Read timed out',
-  'Failed to establish a new connection',
-  'ProxyError',
-  'SSLError',
-  'CERTIFICATE_VERIFY_FAILED',
-  'retries exceeded'
-].freeze
+  "Temporary failure in name resolution",
+  "Name or service not known",
+  "nodename nor servname provided",
+  "Network is unreachable",
+  "Connection refused",
+  "Read timed out",
+  "Failed to establish a new connection",
+  "ProxyError",
+  "SSLError",
+  "CERTIFICATE_VERIFY_FAILED",
+  "retries exceeded"
+]
 
-# Raised for anything that should fail the step with a readable message
-# instead of a Ruby backtrace.
-class StepError < StandardError; end
-
-# Raised when a command exceeds its timeout, so a hung scan never hangs a build.
-class CommandTimeout < StepError; end
-
-def env_value(key)
-  value = ENV[key]
-  value.nil? || value.strip.empty? ? nil : value.strip
+###### Enviroment Variable Check
+def env_has_key(key)
+  return (ENV[key] != nil && ENV[key] != "") ? ENV[key] : abort("Missing #{key}.")
 end
 
-def env_flag(key, default: false)
-  value = env_value(key)
-  return default if value.nil?
-
-  %w[true 1 yes on].include?(value.downcase)
+def env_default(key, default)
+  return (ENV[key] != nil && ENV[key] != "") ? ENV[key].strip : default
 end
 
-# The pip index URL may embed credentials, so it is masked in the command log.
-def maskable_values
-  [env_value('AC_MOBSFSCAN_PIP_INDEX_URL')].compact
+if __FILE__ == $PROGRAM_NAME
+
+$step_temp = env_has_key("AC_STEP_TEMP")
+$repository_path = env_has_key("AC_REPOSITORY_DIR")
+$output_path = ENV["AC_OUTPUT_DIR"]
+$env_file_path = ENV["AC_ENV_FILE_PATH"]
+
+$venv_path = "#{$step_temp}/mobsfscan-venv"
+$report_path = "#{$step_temp}/mobsfscan_reports"
+
+#mobsfscan_version - Pinned on purpose, never "latest", so builds stay reproducible
+$mobsfscan_version = env_default("AC_MOBSFSCAN_VERSION", DEFAULT_MOBSFSCAN_VERSION)
+
+#save_report - Options: true, false
+$save_report = env_default("AC_MOBSFSCAN_SAVE_REPORT", "true") != "false"
+
+#pip_index_url - Masked in the logs, it may carry credentials
+$pip_index_url = env_default("AC_MOBSFSCAN_PIP_INDEX_URL", nil)
+
+#pip_find_links - Directory or URL of the wheels for an air gapped install
+$pip_find_links = env_default("AC_MOBSFSCAN_PIP_FIND_LINKS", nil)
+
+end # if __FILE__ == $PROGRAM_NAME
+
+###### Abort Function
+def abort_script(error)
+  abort("@@[error] #{error}")
 end
 
-def mask(text)
-  maskable_values.reduce(text) { |acc, secret| acc.gsub(secret, '***') }
+###### Log Masking
+# The pip index URL may embed credentials, so it never reaches the build log.
+def mask_secrets(text)
+  masked = "#{text}"
+  return masked if $pip_index_url == nil
+
+  return masked.gsub($pip_index_url, "***")
 end
 
-def log_command(argv)
-  puts "@@[command] #{mask(argv.shelljoin)}"
-end
+###### Run Command Function
+# The command is an argv array and is never handed to a shell, so user supplied
+# paths and free form parameters cannot be reinterpreted as shell syntax.
+# Returns stdout, stderr and the exit code.
+def run_command(command, skip_abort, timeout = nil, environment = {})
+  puts "@@[command] #{mask_secrets(command.shelljoin)}"
 
-def kill_process_group(pid)
-  Process.kill('TERM', -pid)
-  sleep 3
-  Process.kill('KILL', -pid)
-rescue Errno::ESRCH, Errno::EPERM
-  nil
-end
-
-# Runs argv without a shell, so user supplied paths and parameters cannot be
-# reinterpreted as shell syntax. Returns [stdout, stderr, exit_status].
-def run_command(argv, env: {}, timeout: nil, echo: true)
-  log_command(argv)
-  stdout_text = +''
-  stderr_text = +''
+  stdout_str = ""
+  stderr_str = ""
   status = nil
 
-  Open3.popen3(env, *argv, pgroup: true) do |stdin, stdout, stderr, wait_thread|
-    stdin.close
-    readers = [
-      Thread.new { stdout.each_line { |line| stdout_text << line; puts line if echo } },
-      Thread.new { stderr.each_line { |line| stderr_text << line } }
-    ]
+  begin
+    Open3.popen3(environment, *command, :pgroup => true) do |stdin, stdout, stderr, wait_thr|
+      stdin.close
+      readers = [
+        Thread.new { stdout.each_line { |line| stdout_str += line } },
+        Thread.new { stderr.each_line { |line| stderr_str += line } }
+      ]
 
-    if timeout && wait_thread.join(timeout).nil?
-      kill_process_group(wait_thread.pid)
-      readers.each(&:kill)
-      raise CommandTimeout, "`#{mask(argv.first)}` exceeded the #{timeout} second timeout and was terminated."
+      if timeout != nil && wait_thr.join(timeout) == nil
+        kill_process_group(wait_thr.pid)
+        readers.each { |reader| reader.kill }
+        abort_script("`#{File.basename(command[0])}` exceeded the #{timeout} second timeout and was terminated.")
+      end
+
+      readers.each { |reader| reader.join }
+      status = wait_thr.value
     end
-
-    readers.each(&:join)
-    status = wait_thread.value
+  rescue Errno::ENOENT
+    abort_script("#{command[0]} was not found on this runner.")
   end
 
-  [stdout_text, stderr_text, status.exitstatus]
-rescue Errno::ENOENT
-  raise StepError, "#{argv.first} was not found on this runner."
+  unless status.success?
+    abort_script(mask_secrets(stderr_str)) unless skip_abort
+  end
+
+  return stdout_str, stderr_str, status.exitstatus
 end
 
-def resolve_source_path
-  repository_dir = env_value('AC_REPOSITORY_DIR') || raise(StepError, 'AC_REPOSITORY_DIR is not set.')
-  configured = env_value('AC_MOBSFSCAN_SOURCE_PATH') || repository_dir
-  path = Pathname.new(configured).absolute? ? configured : File.join(repository_dir, configured)
-  path = File.expand_path(path)
-  raise StepError, "The source path to scan does not exist: #{path}" unless File.exist?(path)
-
-  path
+# A stuck scan must never hang the build, so the whole process group goes down.
+def kill_process_group(pid)
+  begin
+    Process.kill("TERM", -pid)
+    sleep 3
+    Process.kill("KILL", -pid)
+  rescue Errno::ESRCH, Errno::EPERM
+    return
+  end
 end
 
-def resolve_scan_type
-  scan_type = (env_value('AC_MOBSFSCAN_SCAN_TYPE') || DEFAULT_SCAN_TYPE).downcase
+###### Input Parsing
+def get_source_path()
+  configured = env_default("AC_MOBSFSCAN_SOURCE_PATH", $repository_path)
+  if (Pathname.new configured).absolute?
+    source_path = File.expand_path(configured)
+  else
+    source_path = File.expand_path((Pathname.new $repository_path).join(configured))
+  end
+
+  unless File.exist?(source_path)
+    abort_script("The source path to scan does not exist: #{source_path}")
+  end
+
+  return source_path
+end
+
+#scan_type - Options: auto, android, ios
+def get_scan_type()
+  scan_type = env_default("AC_MOBSFSCAN_SCAN_TYPE", DEFAULT_SCAN_TYPE).downcase
   unless SCAN_TYPES.include?(scan_type)
-    raise StepError, "Invalid scan type `#{scan_type}`. Supported values: #{SCAN_TYPES.join(', ')}."
+    abort_script("Invalid scan type `#{scan_type}`. Supported values: #{SCAN_TYPES.join(", ")}.")
   end
 
-  scan_type
+  return scan_type
 end
 
-def resolve_threshold
-  threshold = (env_value('AC_MOBSFSCAN_SEVERITY_THRESHOLD') || DEFAULT_SEVERITY_THRESHOLD).downcase
-  unless THRESHOLDS.include?(threshold)
-    raise StepError, "Invalid severity threshold `#{threshold}`. Supported values: #{THRESHOLDS.join(', ')}."
+#severity_threshold - Options: none, info, warning, error
+def get_severity_threshold()
+  threshold = env_default("AC_MOBSFSCAN_SEVERITY_THRESHOLD", DEFAULT_SEVERITY_THRESHOLD).downcase
+  unless SEVERITY_THRESHOLDS.include?(threshold)
+    abort_script("Invalid severity threshold `#{threshold}`. Supported values: #{SEVERITY_THRESHOLDS.join(", ")}.")
   end
 
-  threshold
+  return threshold
 end
 
-def resolve_formats
-  requested = (env_value('AC_MOBSFSCAN_OUTPUT_FORMATS') || DEFAULT_OUTPUT_FORMATS)
-              .downcase.split(',').map(&:strip).reject(&:empty?).uniq
-  unknown = requested - OUTPUT_FORMATS.keys
+#output_formats - Options: sarif, json, html, sonarqube, gitlab-sast
+def get_output_formats()
+  configured = env_default("AC_MOBSFSCAN_OUTPUT_FORMATS", DEFAULT_OUTPUT_FORMATS).downcase
+  formats = []
+  configured.split(",").each do |format|
+    format = format.strip
+    next if format == ""
+
+    formats.push(format) unless formats.include?(format)
+  end
+
+  unknown = formats - OUTPUT_FORMATS.keys
   unless unknown.empty?
-    raise StepError, "Unsupported output format(s): #{unknown.join(', ')}. " \
-                     "Supported values: #{OUTPUT_FORMATS.keys.join(', ')}."
+    abort_script("Unsupported output format(s): #{unknown.join(", ")}. " \
+                 "Supported values: #{OUTPUT_FORMATS.keys.join(", ")}.")
   end
-  raise StepError, 'At least one output format is required.' if requested.empty?
+  abort_script("At least one output format is required.") if formats.empty?
 
-  requested
+  return formats
 end
 
-def resolve_timeout
-  value = env_value('AC_MOBSFSCAN_TIMEOUT') || DEFAULT_SCAN_TIMEOUT.to_s
-  timeout = value.to_i
-  raise StepError, "Invalid timeout `#{value}`. A positive number of seconds is expected." unless timeout.positive?
+def get_scan_timeout()
+  configured = env_default("AC_MOBSFSCAN_TIMEOUT", "#{DEFAULT_SCAN_TIMEOUT}")
+  timeout = configured.to_i
+  unless timeout > 0
+    abort_script("Invalid timeout `#{configured}`. A positive number of seconds is expected.")
+  end
 
-  timeout
+  return timeout
 end
 
 # When the config input is empty, mobsfscan discovers a `.mobsf` file at the
 # scan root on its own, so -c is deliberately not passed.
-def resolve_config_path(source_path)
-  configured = env_value('AC_MOBSFSCAN_CONFIG_PATH')
-  return nil if configured.nil?
+def get_config_path(source_path)
+  configured = env_default("AC_MOBSFSCAN_CONFIG_PATH", nil)
+  return nil if configured == nil
 
-  path = Pathname.new(configured).absolute? ? configured : File.join(source_path, configured)
-  path = File.expand_path(path)
-  raise StepError, "The mobsfscan config file does not exist: #{path}" unless File.file?(path)
-
-  path
-end
-
-def python_executable
-  stdout, _stderr, exit_status = run_command(%w[python3 -V], echo: false)
-  raise StepError, 'python3 was not found on this runner. mobsfscan needs python3 and pip to be installed.' unless exit_status&.zero?
-
-  version = stdout.strip[/(\d+)\.(\d+)(?:\.(\d+))?/]
-  puts "Using python3 #{version}"
-  if version && (version.split('.').first(2).map(&:to_i) <=> RECOMMENDED_PYTHON).negative?
-    puts "@@[warning] Python #{version} is older than #{RECOMMENDED_PYTHON.join('.')}, " \
-         'which recent mobsfscan releases require. The install may fail.'
-  end
-  'python3'
-end
-
-def create_virtualenv(python, step_temp)
-  venv_dir = File.join(step_temp, 'mobsfscan-venv')
-  FileUtils.rm_rf(venv_dir)
-  _stdout, stderr, exit_status = run_command([python, '-m', 'venv', venv_dir], timeout: VENV_TIMEOUT, echo: false)
-  unless exit_status&.zero?
-    raise StepError, "Could not create a Python virtualenv under #{step_temp}. " \
-                     "Make sure the `venv` module is available for python3.\n#{stderr}"
-  end
-
-  venv_dir
-end
-
-def pip_install_argv(venv_dir, version)
-  argv = [File.join(venv_dir, 'bin', 'pip'), 'install', '--no-input', '--disable-pip-version-check',
-          "mobsfscan==#{version}"]
-  find_links = env_value('AC_MOBSFSCAN_PIP_FIND_LINKS')
-  index_url = env_value('AC_MOBSFSCAN_PIP_INDEX_URL')
-  argv.push('--no-index', '--find-links', find_links) if find_links
-  argv.push('--index-url', index_url) if index_url
-  argv
-end
-
-def install_failure_message(version, output)
-  if NETWORK_ERROR_PATTERNS.any? { |pattern| output.include?(pattern) }
-    'mobsfscan could not be installed because this runner has no usable outbound network access to the ' \
-    'Python package index. Provide an internal index with the pip index URL input, or an offline wheel ' \
-    'directory with the pip find-links input.'
-  elsif output.include?('Requires-Python') || output.include?('requires a different Python')
-    "mobsfscan #{version} is not compatible with the python3 version on this runner. " \
-    'Pin an older mobsfscan version or use a newer Python.'
-  elsif output.include?('No matching distribution') || output.include?('Could not find a version')
-    "mobsfscan #{version} was not found on the configured package index. " \
-    'Check the pinned version and the index configuration.'
+  if (Pathname.new configured).absolute?
+    config_path = File.expand_path(configured)
   else
-    "Installing mobsfscan #{version} failed."
+    config_path = File.expand_path((Pathname.new source_path).join(configured))
   end
-end
 
-# The venv is isolated on purpose: a global or --user install breaks on
-# PEP 668 managed interpreters and leaks into the pinned runner toolchain.
-# mobsfscan shells out to `semgrep`, so the venv's bin directory has to be on
-# PATH for the pattern matching rules to run at all.
-def venv_env(venv_dir)
-  {
-    'PATH' => "#{File.join(venv_dir, 'bin')}#{File::PATH_SEPARATOR}#{ENV.fetch('PATH', '')}",
-    'VIRTUAL_ENV' => venv_dir,
-    'PYTHONPATH' => nil,
-    'PYTHONHOME' => nil,
-    'PIP_DISABLE_PIP_VERSION_CHECK' => '1'
-  }
-end
+  unless File.file?(config_path)
+    abort_script("The mobsfscan config file does not exist: #{config_path}")
+  end
 
-def install_mobsfscan(venv_dir, version)
-  puts "Installing mobsfscan #{version} into an isolated virtualenv"
-  stdout, stderr, exit_status = run_command(pip_install_argv(venv_dir, version),
-                                            env: venv_env(venv_dir), timeout: INSTALL_TIMEOUT, echo: false)
-  # pip echoes the index URL back on failure, so the message is masked too.
-  raise StepError, mask("#{install_failure_message(version, stdout + stderr)}\n#{stderr}") unless exit_status&.zero?
-
-  verify_installed_version(venv_dir, version)
-end
-
-# `mobsfscan --version` writes through its logger, so the version lands on
-# stderr rather than stdout.
-def verify_installed_version(venv_dir, requested)
-  stdout, stderr, _exit_status = run_command([File.join(venv_dir, 'bin', 'mobsfscan'), '--version'],
-                                             env: venv_env(venv_dir), timeout: 120, echo: false)
-  installed = "#{stdout}\n#{stderr}"[/mobsfscan:?\s+v?(\d+\.\d+(?:\.\d+)?)/, 1]
-  puts "mobsfscan #{installed || 'version unknown'} is ready"
-  return if installed.nil? || installed == requested
-
-  puts "@@[warning] Requested mobsfscan #{requested} but #{installed} is installed."
-end
-
-def scan_argv(venv_dir, format, output_file, source_path, scan_type, config_path)
-  argv = [File.join(venv_dir, 'bin', 'mobsfscan'), OUTPUT_FORMATS.fetch(format)[:flag],
-          '--type', scan_type, '-o', output_file]
-  argv.push('-c', config_path) if config_path
-  # The step decides success or failure by parsing the JSON report, so the tool
-  # is told never to fail. A non zero exit code then means mobsfscan itself
-  # broke, not that it found something.
-  argv.push('--no-fail')
-  argv.concat(extra_parameters)
-  argv.push(source_path)
+  return config_path
 end
 
 # Free form parameters are split with shell word rules and passed as separate
 # argv entries, they are never re-evaluated by a shell.
-def extra_parameters
-  extra = env_value('AC_MOBSFSCAN_EXTRA_PARAMETERS')
-  return [] if extra.nil?
+def get_extra_parameters()
+  extra = env_default("AC_MOBSFSCAN_EXTRA_PARAMETERS", nil)
+  return [] if extra == nil
 
-  Shellwords.split(extra)
-rescue ArgumentError => e
-  raise StepError, "The extra parameters input could not be parsed: #{e.message}"
+  begin
+    return Shellwords.split(extra)
+  rescue ArgumentError => e
+    abort_script("The extra parameters input could not be parsed: #{e.message}")
+  end
 end
 
-def parse_report(path)
-  raise StepError, "mobsfscan did not produce a report at #{path}." unless File.file?(path)
+###### Python & mobsfscan Installation
+def get_python_executable()
+  stdout_str, stderr_str, exit_code = run_command(["python3", "-V"], true)
+  unless exit_code == 0
+    abort_script("python3 was not found on this runner. mobsfscan needs python3 and pip to be installed.")
+  end
 
-  JSON.parse(File.read(path))
-rescue JSON::ParserError => e
-  raise StepError, "The mobsfscan JSON report at #{path} could not be parsed: #{e.message}"
+  version = "#{stdout_str}#{stderr_str}"[/(\d+)\.(\d+)(?:\.(\d+))?/]
+  puts "Using python3 #{version}"
+
+  if version != nil
+    major_minor = version.split(".")[0, 2].map { |part| part.to_i }
+    if (major_minor <=> RECOMMENDED_PYTHON) < 0
+      puts "@@[warning] Python #{version} is older than #{RECOMMENDED_PYTHON.join(".")}, " \
+           "which recent mobsfscan releases require. The install may fail."
+    end
+  end
+
+  return "python3"
+end
+
+# The virtualenv is isolated on purpose: a global or --user install is rejected
+# by PEP 668 managed interpreters on macOS runners, and inside the Android
+# container the step runs as root, where it would leak into the pinned runner
+# toolchain. AC_STEP_TEMP is discarded when the step ends, so there is no cleanup.
+def create_virtualenv(python, venv_path)
+  FileUtils.rm_rf(venv_path)
+  stdout_str, stderr_str, exit_code = run_command([python, "-m", "venv", venv_path], true, VENV_TIMEOUT)
+  unless exit_code == 0
+    abort_script("Could not create a Python virtualenv at #{venv_path}. " \
+                 "Make sure the `venv` module is available for python3.\n#{stderr_str}")
+  end
+
+  return venv_path
+end
+
+# mobsfscan shells out to `semgrep`, so the virtualenv's bin directory has to be
+# on PATH for the pattern matching rules to run at all.
+def venv_environment(venv_path)
+  return {
+    "PATH" => "#{venv_path}/bin#{File::PATH_SEPARATOR}#{ENV["PATH"]}",
+    "VIRTUAL_ENV" => venv_path,
+    "PYTHONPATH" => nil,
+    "PYTHONHOME" => nil,
+    "PIP_DISABLE_PIP_VERSION_CHECK" => "1"
+  }
+end
+
+def get_pip_install_command(venv_path, version)
+  command = ["#{venv_path}/bin/pip", "install", "--no-input", "--disable-pip-version-check",
+             "mobsfscan==#{version}"]
+
+  if $pip_find_links != nil
+    command.push("--no-index")
+    command.push("--find-links")
+    command.push($pip_find_links)
+  end
+
+  if $pip_index_url != nil
+    command.push("--index-url")
+    command.push($pip_index_url)
+  end
+
+  return command
+end
+
+def get_install_failure_message(version, output)
+  if NETWORK_ERROR_PATTERNS.any? { |pattern| output.include?(pattern) }
+    return "mobsfscan could not be installed because this runner has no usable outbound network " \
+           "access to the Python package index. Provide an internal index with the pip index URL " \
+           "input, or an offline wheel directory with the pip find-links input."
+  elsif output.include?("Requires-Python") || output.include?("requires a different Python")
+    return "mobsfscan #{version} is not compatible with the python3 version on this runner. " \
+           "Pin an older mobsfscan version or use a newer Python."
+  elsif output.include?("No matching distribution") || output.include?("Could not find a version")
+    return "mobsfscan #{version} was not found on the configured package index. " \
+           "Check the pinned version and the index configuration."
+  else
+    return "Installing mobsfscan #{version} failed."
+  end
+end
+
+def install_mobsfscan(venv_path, version)
+  puts "Installing mobsfscan #{version} into an isolated virtualenv"
+  command = get_pip_install_command(venv_path, version)
+  stdout_str, stderr_str, exit_code = run_command(command, true, INSTALL_TIMEOUT, venv_environment(venv_path))
+
+  unless exit_code == 0
+    # pip echoes the index URL back on failure, so the message is masked too.
+    message = get_install_failure_message(version, "#{stdout_str}#{stderr_str}")
+    abort_script(mask_secrets("#{message}\n#{stderr_str}"))
+  end
+
+  verify_installed_version(venv_path, version)
+end
+
+# `mobsfscan --version` writes through its logger, so the version lands on
+# stderr rather than stdout.
+def verify_installed_version(venv_path, requested)
+  stdout_str, stderr_str, exit_code = run_command(["#{venv_path}/bin/mobsfscan", "--version"], true,
+                                                  VERSION_TIMEOUT, venv_environment(venv_path))
+  installed = "#{stdout_str}\n#{stderr_str}"[/mobsfscan:?\s+v?(\d+\.\d+(?:\.\d+)?)/, 1]
+  puts "mobsfscan #{installed != nil ? installed : "version unknown"} is ready"
+  return if installed == nil || installed == requested
+
+  puts "@@[warning] Requested mobsfscan #{requested} but #{installed} is installed."
+end
+
+###### Scan
+def get_scan_command(format, output_file)
+  command = ["#{$venv_path}/bin/mobsfscan", OUTPUT_FORMATS[format][:flag],
+             "--type", $scan_type, "-o", output_file]
+
+  if $config_path != nil
+    command.push("-c")
+    command.push($config_path)
+  end
+
+  # The step decides success or failure by parsing the JSON report, so the tool
+  # is told never to fail. A non zero exit code then means mobsfscan itself
+  # broke, not that it found something.
+  command.push("--no-fail")
+  command.concat($extra_parameters)
+  command.push($source_path)
+
+  return command
+end
+
+def run_scan(format)
+  output_file = "#{$report_path}/#{OUTPUT_FORMATS[format][:filename]}"
+  command = get_scan_command(format, output_file)
+  stdout_str, stderr_str, exit_code = run_command(command, true, $scan_timeout, venv_environment($venv_path))
+
+  unless exit_code == 0
+    abort_script("mobsfscan failed while producing the #{format} report.\n#{stderr_str}")
+  end
+
+  return output_file
+end
+
+###### Report Parsing & Severity Threshold
+def parse_report(path)
+  unless File.file?(path)
+    abort_script("mobsfscan did not produce a report at #{path}.")
+  end
+
+  begin
+    return JSON.parse(File.read(path))
+  rescue JSON::ParserError => e
+    abort_script("The mobsfscan JSON report at #{path} could not be parsed: #{e.message}")
+  end
+end
+
+# A silently semgrep-less install reports only best practice rules, which would
+# otherwise look like a clean project.
+def check_scan_errors(report)
+  errors = report["errors"] != nil ? report["errors"] : []
+  return if errors.empty?
+
+  errors.each { |error| puts "@@[warning] mobsfscan reported: #{error}" }
+  return unless errors.any? { |error| "#{error}".include?("semgrep not found") }
+
+  abort_script("semgrep is missing from the mobsfscan installation, so only best practice rules " \
+               "ran. This is an installation problem, not a clean scan result.")
 end
 
 # File level matches and "missing best practice" rules are counted separately:
 # best practice rules carry no file location and always report on a project.
-def summarize(report)
-  findings = SEVERITIES.to_h { |severity| [severity, 0] }
-  best_practices = SEVERITIES.to_h { |severity| [severity, 0] }
+def summarize_report(report)
+  findings = {}
+  best_practices = {}
+  totals = {}
+  SEVERITIES.each do |severity|
+    findings[severity] = 0
+    best_practices[severity] = 0
+  end
 
-  (report['results'] || {}).each_value do |detail|
-    severity = detail.dig('metadata', 'severity')
-    severity = 'INFO' unless SEVERITIES.include?(severity)
-    files = detail['files'] || []
+  results = report["results"] != nil ? report["results"] : {}
+  results.each do |rule_id, detail|
+    severity = detail["metadata"] != nil ? detail["metadata"]["severity"] : nil
+    severity = "INFO" unless SEVERITIES.include?(severity)
+    files = detail["files"] != nil ? detail["files"] : []
+
     if files.empty?
       best_practices[severity] += 1
     else
@@ -323,151 +443,152 @@ def summarize(report)
     end
   end
 
-  totals = SEVERITIES.to_h { |severity| [severity, findings[severity] + best_practices[severity]] }
-  {
-    findings: findings,
-    best_practices: best_practices,
-    totals: totals,
-    total: totals.values.sum,
-    highest: SEVERITIES.find { |severity| totals[severity].positive? }
+  total = 0
+  highest = nil
+  SEVERITIES.each do |severity|
+    totals[severity] = findings[severity] + best_practices[severity]
+    total += totals[severity]
+    highest = severity if highest == nil && totals[severity] > 0
+  end
+
+  return {
+    :findings => findings,
+    :best_practices => best_practices,
+    :totals => totals,
+    :total => total,
+    :highest => highest
   }
 end
 
 def print_summary(summary, threshold)
-  puts ''
-  puts 'mobsfscan summary'
+  puts "------------------------------------------------------"
+  puts "mobsfscan Summary"
   SEVERITIES.each do |severity|
-    puts format('  %-8s %3d finding(s), %d missing best practice(s)',
-                severity, summary[:findings][severity], summary[:best_practices][severity])
+    puts "#{severity} : #{summary[:findings][severity]} finding(s), " \
+         "#{summary[:best_practices][severity]} missing best practice(s)"
   end
-  puts "  total    #{summary[:total]} finding(s), highest severity: #{summary[:highest] || 'none'}"
-  puts "  threshold: #{threshold}"
-  puts ''
+  puts "Total : #{summary[:total]} finding(s)"
+  puts "Highest Severity : #{summary[:highest] != nil ? summary[:highest] : "none"}"
+  puts "Severity Threshold : #{threshold}"
+  puts "------------------------------------------------------"
 end
 
-def threshold_exceeded?(summary, threshold)
-  return false if threshold == 'none'
+def is_threshold_exceeded(summary, threshold)
+  return false if threshold == "none"
 
-  minimum = SEVERITY_RANK.fetch(threshold.upcase)
-  SEVERITIES.any? { |severity| SEVERITY_RANK[severity] >= minimum && summary[:totals][severity].positive? }
+  minimum = SEVERITY_RANK[threshold.upcase]
+  return SEVERITIES.any? { |severity| SEVERITY_RANK[severity] >= minimum && summary[:totals][severity] > 0 }
 end
 
-def report_scan_errors(report)
-  errors = report['errors'] || []
-  return if errors.empty?
-
-  errors.each { |error| puts "@@[warning] mobsfscan reported: #{error}" }
-  return unless errors.any? { |error| error.to_s.include?('semgrep not found') }
-
-  raise StepError, 'semgrep is missing from the mobsfscan installation, so only best practice rules ran. ' \
-                   'This is an installation problem, not a clean scan result.'
-end
-
-def copy_reports(report_dir, filenames)
-  output_dir = env_value('AC_OUTPUT_DIR')
-  if output_dir.nil?
-    puts '@@[warning] AC_OUTPUT_DIR is not set, the reports are not published as artifacts.'
+###### Report Publishing & Environment Variables
+def copy_reports(report_path, filenames)
+  if $output_path == nil
+    puts "@@[warning] AC_OUTPUT_DIR is not set, the reports are not published as artifacts."
     return nil
   end
 
-  export_dir = File.join(output_dir, 'mobsfscan_output')
-  FileUtils.mkdir_p(export_dir)
-  filenames.each do |filename|
-    source = File.join(report_dir, filename)
-    next unless File.file?(source)
+  export_path = (Pathname.new $output_path).join("mobsfscan_output").to_s
+  begin
+    FileUtils.mkdir_p(export_path)
+    filenames.each do |filename|
+      source = "#{report_path}/#{filename}"
+      next unless File.file?(source)
 
-    puts "Copying #{filename} to #{export_dir}"
-    FileUtils.cp(source, File.join(export_dir, filename))
+      puts "Copying #{filename} to #{export_path}"
+      FileUtils.cp(source, "#{export_path}/#{filename}")
+    end
+  rescue Exception => e
+    abort_script(e)
   end
-  export_dir
+
+  return export_path
 end
 
-def write_outputs(values)
-  env_file = env_value('AC_ENV_FILE_PATH')
-  if env_file.nil?
-    puts '@@[warning] AC_ENV_FILE_PATH is not set, the step outputs are not exported.'
+def write_environment_variables(values)
+  if $env_file_path == nil
+    puts "@@[warning] AC_ENV_FILE_PATH is not set, the step outputs are not exported."
     return
   end
 
-  File.open(env_file, 'a') do |file|
-    values.each { |key, value| file.puts("#{key}=#{value}") }
+  begin
+    open($env_file_path, 'a') { |f|
+      values.each { |key, value| f.puts "#{key}=#{value}" }
+    }
+  rescue Exception => e
+    abort_script(e)
   end
 end
 
-def run_step
-  step_temp = env_value('AC_STEP_TEMP') || raise(StepError, 'AC_STEP_TEMP is not set.')
-  source_path = resolve_source_path
-  scan_type = resolve_scan_type
-  threshold = resolve_threshold
-  requested_formats = resolve_formats
-  timeout = resolve_timeout
-  config_path = resolve_config_path(source_path)
-  version = env_value('AC_MOBSFSCAN_VERSION') || DEFAULT_MOBSFSCAN_VERSION
-
-  puts "Scanning #{source_path} (type: #{scan_type}, formats: #{requested_formats.join(', ')})"
-  puts config_path ? "Using mobsfscan config #{config_path}" : 'No explicit config, a `.mobsf` file at the scan root is picked up automatically'
-
-  venv_dir = create_virtualenv(python_executable, step_temp)
-  install_mobsfscan(venv_dir, version)
-
-  report_dir = File.join(step_temp, 'mobsfscan_reports')
-  FileUtils.mkdir_p(report_dir)
-
-  # JSON is always produced: it is the report the threshold decision is made
-  # from. It is only published as an artifact when the user asked for it.
-  produced = {}
-  (['json'] + requested_formats).uniq.each do |format|
-    filename = OUTPUT_FORMATS.fetch(format)[:filename]
-    output_file = File.join(report_dir, filename)
-    _stdout, stderr, exit_status = run_command(
-      scan_argv(venv_dir, format, output_file, source_path, scan_type, config_path),
-      env: venv_env(venv_dir), timeout: timeout, echo: false
-    )
-    unless exit_status&.zero?
-      raise StepError, "mobsfscan failed while producing the #{format} report.\n#{stderr}"
-    end
-
-    produced[format] = output_file
-  end
-
-  report = parse_report(produced.fetch('json'))
-  report_scan_errors(report)
-  summary = summarize(report)
-  print_summary(summary, threshold)
-
-  export_dir = nil
-  if env_flag('AC_MOBSFSCAN_SAVE_REPORT', default: true)
-    export_dir = copy_reports(report_dir, requested_formats.map { |format| OUTPUT_FORMATS.fetch(format)[:filename] })
-  end
-
+def get_step_outputs(summary, report_dir, formats)
   outputs = {
-    'AC_MOBSFSCAN_REPORT_DIR' => export_dir || report_dir,
-    'AC_MOBSFSCAN_FINDING_COUNT' => summary[:total],
-    'AC_MOBSFSCAN_ERROR_COUNT' => summary[:totals]['ERROR'],
-    'AC_MOBSFSCAN_WARNING_COUNT' => summary[:totals]['WARNING'],
-    'AC_MOBSFSCAN_INFO_COUNT' => summary[:totals]['INFO'],
-    'AC_MOBSFSCAN_HIGHEST_SEVERITY' => summary[:highest] || 'NONE'
+    "AC_MOBSFSCAN_REPORT_DIR" => report_dir,
+    "AC_MOBSFSCAN_FINDING_COUNT" => summary[:total],
+    "AC_MOBSFSCAN_ERROR_COUNT" => summary[:totals]["ERROR"],
+    "AC_MOBSFSCAN_WARNING_COUNT" => summary[:totals]["WARNING"],
+    "AC_MOBSFSCAN_INFO_COUNT" => summary[:totals]["INFO"],
+    "AC_MOBSFSCAN_HIGHEST_SEVERITY" => summary[:highest] != nil ? summary[:highest] : "NONE"
   }
-  requested_formats.each do |format|
-    next unless %w[json sarif].include?(format)
 
-    path = File.join(export_dir || report_dir, OUTPUT_FORMATS.fetch(format)[:filename])
-    outputs["AC_MOBSFSCAN_#{format.upcase}_REPORT_PATH"] = path
-  end
-  write_outputs(outputs)
+  formats.each do |format|
+    next unless ["json", "sarif"].include?(format)
 
-  if threshold_exceeded?(summary, threshold)
-    raise StepError, "mobsfscan found findings at or above the `#{threshold}` severity threshold. " \
-                     'The reports are still published as artifacts.'
+    outputs["AC_MOBSFSCAN_#{format.upcase}_REPORT_PATH"] = "#{report_dir}/#{OUTPUT_FORMATS[format][:filename]}"
   end
 
-  puts 'mobsfscan completed without exceeding the severity threshold.'
+  return outputs
 end
+
+###############################################################
 
 if __FILE__ == $PROGRAM_NAME
-  begin
-    run_step
-  rescue StepError => e
-    abort("@@[error] #{e.message}")
-  end
+
+$source_path = get_source_path()
+$scan_type = get_scan_type()
+$severity_threshold = get_severity_threshold()
+$output_formats = get_output_formats()
+$scan_timeout = get_scan_timeout()
+$config_path = get_config_path($source_path)
+$extra_parameters = get_extra_parameters()
+
+puts "Scanning #{$source_path} (type: #{$scan_type}, formats: #{$output_formats.join(", ")})"
+if $config_path != nil
+  puts "Using mobsfscan config #{$config_path}"
+else
+  puts "No explicit config, a `.mobsf` file at the scan root is picked up automatically"
 end
+
+create_virtualenv(get_python_executable(), $venv_path)
+install_mobsfscan($venv_path, $mobsfscan_version)
+
+FileUtils.mkdir_p($report_path)
+
+### JSON is always produced, it is the report the threshold decision is made
+### from. It is only published as an artifact when the user asked for it.
+scan_formats = ["json"]
+$output_formats.each { |format| scan_formats.push(format) unless scan_formats.include?(format) }
+scan_formats.each { |format| run_scan(format) }
+
+$report = parse_report("#{$report_path}/#{OUTPUT_FORMATS["json"][:filename]}")
+check_scan_errors($report)
+
+$summary = summarize_report($report)
+print_summary($summary, $severity_threshold)
+
+$export_path = nil
+if $save_report
+  filenames = $output_formats.map { |format| OUTPUT_FORMATS[format][:filename] }
+  $export_path = copy_reports($report_path, filenames)
+end
+
+write_environment_variables(get_step_outputs($summary, $export_path != nil ? $export_path : $report_path, $output_formats))
+
+if is_threshold_exceeded($summary, $severity_threshold)
+  abort_script("mobsfscan found findings at or above the `#{$severity_threshold}` severity " \
+               "threshold. The reports are still published as artifacts.")
+end
+
+puts "mobsfscan completed without exceeding the severity threshold."
+
+exit 0
+
+end # if __FILE__ == $PROGRAM_NAME

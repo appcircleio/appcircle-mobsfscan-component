@@ -167,21 +167,24 @@ instead of surfacing a raw pip error.
 
 ## Development
 
-The test suite uses minitest from the Ruby standard library, no Bundler and no gems:
+The test suite requires the [RSpec](https://rspec.info) gem and the Ruby standard library. No
+Gemfile or Bundler needed:
 
 ```bash
-ruby tests/test_main.rb
+ruby test/test_main.rb
 ```
 
-The end to end tests run `main.rb` the way the runner does, against the deliberately insecure
-samples under `tests/sample_projects`. They need `python3` and a reachable package index, and are
+A pass/fail summary is printed at the end of each run.
+
+The end to end examples run `main.rb` the way the runner does, against the deliberately insecure
+samples under `test/sample_projects`. They need `python3` and a reachable package index, and are
 opt in:
 
 ```bash
-MOBSFSCAN_E2E=1 ruby tests/test_main.rb
+MOBSFSCAN_E2E=1 ruby test/test_main.rb
 ```
 
-Each of those tests builds a fresh virtualenv, and installing `mobsfscan` from pypi.org takes
+Each of those examples builds a fresh virtualenv, and installing `mobsfscan` from pypi.org takes
 minutes. Point them at a local wheel directory instead to cut that down, which also exercises
 the air gapped install path:
 
@@ -190,8 +193,8 @@ python3 -m pip download mobsfscan==1.0.0 -d /tmp/mobsfscan-wheelhouse
 ```
 
 ```bash
-MOBSFSCAN_E2E=1 MOBSFSCAN_WHEELHOUSE=/tmp/mobsfscan-wheelhouse ruby tests/test_main.rb
+MOBSFSCAN_E2E=1 MOBSFSCAN_WHEELHOUSE=/tmp/mobsfscan-wheelhouse ruby test/test_main.rb
 ```
 
-The tests that cover the install itself, a pinned version, a bad pin and an unreachable index,
+The examples that cover the install itself, a pinned version, a bad pin and an unreachable index,
 ignore `MOBSFSCAN_WHEELHOUSE` and always go to the configured index.
