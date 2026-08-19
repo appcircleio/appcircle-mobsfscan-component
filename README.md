@@ -28,18 +28,18 @@ Script does not get that variable, so the step then falls back to
 
 - `AC_MOBSFSCAN_SOURCE_PATH`: Source Path. Path of the source code to scan. A relative value is
   resolved against the cloned repository directory. Defaults to the repository root.
-- `AC_MOBSFSCAN_SCAN_TYPE`: Scan Type. `auto` (default), `android` or `ios`. `auto` detects the
-  platform from the source code, the explicit values force a rule set.
+- `AC_MOBSFSCAN_SCAN_TYPE`: Scan Type. A dropdown of `auto` (default), `android` and `ios`.
+  `auto` detects the platform from the source code, the explicit values force a rule set.
 - `AC_MOBSFSCAN_OUTPUT_FORMATS`: Output Formats. Comma separated list of `sarif`, `json`,
   `html`, `sonarqube` and `gitlab-sast`. Defaults to `sarif,json`.
-- `AC_MOBSFSCAN_SEVERITY_THRESHOLD`: Severity Threshold. `error` (default), `warning`, `info` or
-  `none`. The build fails when a finding at or above this severity is reported, `none` makes the
-  step report only.
+- `AC_MOBSFSCAN_SEVERITY_THRESHOLD`: Severity Threshold. A dropdown of `error` (default),
+  `warning`, `info` and `none`. The build fails when a finding at or above this severity is
+  reported, `none` makes the step report only.
 - `AC_MOBSFSCAN_CONFIG_PATH`: Config File Path. Path of the `.mobsf` YAML config for rule
   tuning. A relative value is resolved against the source path. When empty, a `.mobsf` file at
   the scan root is picked up by `mobsfscan` automatically.
-- `AC_MOBSFSCAN_SAVE_REPORT`: Save Report. Report files are copied into the artifacts folder
-  when set to `true` (default).
+- `AC_MOBSFSCAN_SAVE_REPORT`: Save Report. A dropdown of `true` (default) and `false`. Report
+  files are copied into the artifacts folder when set to `true`.
 - `AC_MOBSFSCAN_TIMEOUT`: Scan Timeout. Timeout in seconds for a single `mobsfscan` run,
   default `900`. The step terminates the scan and fails when it is exceeded, so a stuck scan
   never hangs the build.

@@ -18,8 +18,10 @@ inputs:
 - key: "AC_MOBSFSCAN_SCAN_TYPE"
   defaultValue: "auto"
   isRequired: false
+  editorType: select
+  options: "auto,android,ios"
   title: Scan Type
-  description: "Rule set to use: `auto`, `android` or `ios`. `auto` detects the platform from the source code."
+  description: "Rule set to use. `auto` detects the platform from the source code, `android` and `ios` force a rule set."
   helpText:
 - key: "AC_MOBSFSCAN_VERSION"
   defaultValue: "1.0.0"
@@ -36,8 +38,10 @@ inputs:
 - key: "AC_MOBSFSCAN_SEVERITY_THRESHOLD"
   defaultValue: "error"
   isRequired: false
+  editorType: select
+  options: "error,warning,info,none"
   title: Severity Threshold
-  description: "Fails the build when a finding at or above this severity is reported: `error`, `warning`, `info` or `none`. `none` is report only. `info` also counts the informational best practice rules, which report on almost every project."
+  description: "Fails the build when a finding at or above this severity is reported. `none` is report only. `info` also counts the informational best practice rules, which report on almost every project."
   helpText:
 - key: "AC_MOBSFSCAN_CONFIG_PATH"
   isRequired: false
@@ -47,6 +51,8 @@ inputs:
 - key: "AC_MOBSFSCAN_SAVE_REPORT"
   defaultValue: "true"
   isRequired: false
+  editorType: select
+  options: "true,false"
   title: Save Report
   description: "Report files will be copied into the artifacts folder if set to true."
   helpText:
