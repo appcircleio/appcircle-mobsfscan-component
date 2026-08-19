@@ -7,7 +7,7 @@ require 'English'
 
 ###### Defaults & Constants
 DEFAULT_MOBSFSCAN_VERSION = "1.0.0"
-DEFAULT_OUTPUT_FORMATS = "sarif,json"
+DEFAULT_OUTPUT_FORMATS = "sarif"
 DEFAULT_SCAN_TYPE = "auto"
 DEFAULT_SEVERITY_THRESHOLD = "error"
 DEFAULT_SCAN_TIMEOUT = 900

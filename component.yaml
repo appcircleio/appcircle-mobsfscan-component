@@ -30,10 +30,12 @@ inputs:
   description: "The `mobsfscan` version to install with pip. Pinned so that builds stay reproducible."
   helpText:
 - key: "AC_MOBSFSCAN_OUTPUT_FORMATS"
-  defaultValue: "sarif,json"
+  defaultValue: "sarif"
   isRequired: false
-  title: Output Formats
-  description: "Comma separated report formats: `sarif`, `json`, `html`, `sonarqube`, `gitlab-sast`. Each format needs its own scan run, so requesting fewer formats is faster."
+  editorType: select
+  options: "sarif,json,html,sonarqube,gitlab-sast"
+  title: Output Format
+  description: "Report format to publish. Each format costs its own scan run, so the step produces one. Setting the variable to a comma separated list, for example `sarif,json`, still produces several."
   helpText:
 - key: "AC_MOBSFSCAN_SEVERITY_THRESHOLD"
   defaultValue: "error"

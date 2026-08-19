@@ -30,8 +30,10 @@ Script does not get that variable, so the step then falls back to
   resolved against the cloned repository directory. Defaults to the repository root.
 - `AC_MOBSFSCAN_SCAN_TYPE`: Scan Type. A dropdown of `auto` (default), `android` and `ios`.
   `auto` detects the platform from the source code, the explicit values force a rule set.
-- `AC_MOBSFSCAN_OUTPUT_FORMATS`: Output Formats. Comma separated list of `sarif`, `json`,
-  `html`, `sonarqube` and `gitlab-sast`. Defaults to `sarif,json`.
+- `AC_MOBSFSCAN_OUTPUT_FORMATS`: Output Format. A dropdown of `sarif` (default), `json`, `html`,
+  `sonarqube` and `gitlab-sast`. The step form offers one format because each one costs its own
+  scan run. Setting the variable to a comma separated list, for example `sarif,json`, still
+  produces several.
 - `AC_MOBSFSCAN_SEVERITY_THRESHOLD`: Severity Threshold. A dropdown of `error` (default),
   `warning`, `info` and `none`. The build fails when a finding at or above this severity is
   reported, `none` makes the step report only.
@@ -99,8 +101,9 @@ Reports are written under the step's temp directory and, when `AC_MOBSFSCAN_SAVE
 | `gitlab-sast` | `mobsfscan-gitlab-sast.json` |
 
 `mobsfscan` accepts a single `-o`, so **each requested format needs its own scan run**. A run
-takes a few seconds on a small project but scales with the size of the source tree, so request
-only the formats you consume.
+takes a few seconds on a small project but scales with the size of the source tree, which is why
+the step form offers a single format and defaults to `sarif`. Request more only where you consume
+them, by setting `AC_MOBSFSCAN_OUTPUT_FORMATS` to a comma separated list.
 
 Use the `appcircle_export_build_artifacts` step after this one to publish the reports.
 

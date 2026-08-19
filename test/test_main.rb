@@ -218,7 +218,8 @@ def run_main(source, env = {})
                             'AC_OUTPUT_DIR' => output_dir,
                             'AC_ENV_FILE_PATH' => env_file,
                             'AC_MOBSFSCAN_SOURCE_PATH' => source,
-                            'AC_MOBSFSCAN_SEVERITY_THRESHOLD' => 'none'
+                            'AC_MOBSFSCAN_SEVERITY_THRESHOLD' => 'none',
+                            'AC_MOBSFSCAN_OUTPUT_FORMATS' => 'sarif,json'
                           )
                           .merge(wheelhouse_input(env))
                           .merge(env)
@@ -556,8 +557,14 @@ RSpec.describe '#get_output_formats' do
   after { reset_inputs }
 
   context 'positive path' do
-    it 'defaults to sarif and json' do
-      expect(get_output_formats).to eq(%w[sarif json])
+    it 'defaults to sarif, matching the step form default' do
+      expect(get_output_formats).to eq(%w[sarif])
+    end
+
+    # The step form offers one format, but the variable still takes a list.
+    it 'still accepts a comma separated list' do
+      ENV['AC_MOBSFSCAN_OUTPUT_FORMATS'] = 'sarif,json,html'
+      expect(get_output_formats).to eq(%w[sarif json html])
     end
 
     it 'normalizes whitespace and removes duplicates' do
@@ -1051,6 +1058,15 @@ RSpec.describe 'main.rb end to end' do
     # JSON is always generated for the gate, but it is not an artifact unless asked for.
     it 'does not publish the JSON report when only SARIF is requested' do
       run_main('android', 'AC_MOBSFSCAN_OUTPUT_FORMATS' => 'sarif') do |result|
+        expect(result[:success]).to be true
+        expect(File.file?(File.join(result[:output_dir], 'mobsfscan.sarif'))).to be true
+        expect(File.exist?(File.join(result[:output_dir], 'mobsfscan.json'))).to be false
+      end
+    end
+
+    # The step form offers a single format, and the default matches it.
+    it 'publishes only SARIF by default' do
+      run_main('android', 'AC_MOBSFSCAN_OUTPUT_FORMATS' => nil) do |result|
         expect(result[:success]).to be true
         expect(File.file?(File.join(result[:output_dir], 'mobsfscan.sarif'))).to be true
         expect(File.exist?(File.join(result[:output_dir], 'mobsfscan.json'))).to be false
