@@ -130,7 +130,7 @@ require_relative '../main.rb'
 # main.rb keeps its configuration in globals that are assigned only when it runs
 # as the main script, so the unit tests set them directly.
 INPUT_KEYS = %w[
-  AC_REPOSITORY_DIR AC_STEP_TEMP AC_OUTPUT_DIR AC_ENV_FILE_PATH
+  AC_REPOSITORY_DIR AC_STEP_TEMP AC_TEMP_DIR AC_OUTPUT_DIR AC_ENV_FILE_PATH
   AC_MOBSFSCAN_SOURCE_PATH AC_MOBSFSCAN_SCAN_TYPE AC_MOBSFSCAN_VERSION
   AC_MOBSFSCAN_OUTPUT_FORMATS AC_MOBSFSCAN_SEVERITY_THRESHOLD
   AC_MOBSFSCAN_CONFIG_PATH AC_MOBSFSCAN_SAVE_REPORT AC_MOBSFSCAN_TIMEOUT
@@ -214,6 +214,7 @@ def run_main(source, env = {})
                           .merge(
                             'AC_REPOSITORY_DIR' => SAMPLE_PROJECTS,
                             'AC_STEP_TEMP' => step_temp,
+                            'AC_TEMP_DIR' => step_temp,
                             'AC_OUTPUT_DIR' => output_dir,
                             'AC_ENV_FILE_PATH' => env_file,
                             'AC_MOBSFSCAN_SOURCE_PATH' => source,
@@ -318,6 +319,40 @@ RSpec.describe '#env_default' do
 
     it 'returns a nil default for an optional input' do
       expect(env_default('AC_MOBSFSCAN_CONFIG_PATH', nil)).to be_nil
+    end
+  end
+end
+
+RSpec.describe '#get_step_temp' do
+  before { reset_inputs }
+  after { reset_inputs }
+
+  context 'positive path – running as a marketplace component' do
+    it 'uses AC_STEP_TEMP as is' do
+      ENV['AC_STEP_TEMP'] = '/tmp/step-temp'
+      expect(get_step_temp).to eq('/tmp/step-temp')
+    end
+  end
+
+  # A Custom Script does not get AC_STEP_TEMP, only the documented AC_TEMP_DIR.
+  context 'positive path – running as a Custom Script' do
+    it 'falls back to its own folder under AC_TEMP_DIR' do
+      ENV['AC_TEMP_DIR'] = '/tmp/build-temp'
+      expect(get_step_temp).to eq('/tmp/build-temp/appcircle_mobsfscan')
+    end
+
+    it 'prefers AC_STEP_TEMP when both are set' do
+      ENV['AC_STEP_TEMP'] = '/tmp/step-temp'
+      ENV['AC_TEMP_DIR'] = '/tmp/build-temp'
+      expect(get_step_temp).to eq('/tmp/step-temp')
+    end
+  end
+
+  context 'negative path – neither variable set' do
+    it 'aborts naming both variables' do
+      message = capture_abort { get_step_temp }
+      expect(message).to include('AC_STEP_TEMP')
+      expect(message).to include('AC_TEMP_DIR')
     end
   end
 end
@@ -1019,6 +1054,16 @@ RSpec.describe 'main.rb end to end' do
         expect(result[:success]).to be true
         expect(File.file?(File.join(result[:output_dir], 'mobsfscan.sarif'))).to be true
         expect(File.exist?(File.join(result[:output_dir], 'mobsfscan.json'))).to be false
+      end
+    end
+  end
+
+  # This is the path a Custom Script takes, where AC_STEP_TEMP is not provided.
+  context 'positive path – AC_TEMP_DIR fallback' do
+    it 'completes a scan with only AC_TEMP_DIR set' do
+      run_main('android', 'AC_STEP_TEMP' => nil) do |result|
+        expect(result[:success]).to be(true), "step failed:\n#{result[:stdout]}\n#{result[:stderr]}"
+        expect(File.file?(File.join(result[:output_dir], 'mobsfscan.json'))).to be true
       end
     end
   end

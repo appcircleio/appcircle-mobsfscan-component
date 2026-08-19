@@ -1,13 +1,3 @@
-# Appcircle mobsfscan component.
-#
-# Runs mobsfscan (MobSF's source code SAST engine) against the checked out
-# repository. mobsfscan is LGPL-3.0-or-later, so it is not redistributed with
-# Appcircle: it is installed at runtime with pip into an isolated virtualenv
-# under AC_STEP_TEMP and discarded when the step ends.
-#
-# Only Ruby stdlib is used, steps run against the runner's system Ruby without
-# Bundler.
-
 require 'json'
 require 'open3'
 require 'pathname'
@@ -66,9 +56,27 @@ def env_default(key, default)
   return (ENV[key] != nil && ENV[key] != "") ? ENV[key].strip : default
 end
 
+# The virtualenv and the reports live here, and the runner discards it when the
+# build ends, so the step has no cleanup to do.
+def get_step_temp()
+  step_temp = env_default("AC_STEP_TEMP", nil)
+  return step_temp if step_temp != nil
+
+  temp_dir = env_default("AC_TEMP_DIR", nil)
+  if temp_dir == nil
+    abort("Missing AC_STEP_TEMP or AC_TEMP_DIR.")
+  end
+
+  return "#{temp_dir}/appcircle_mobsfscan"
+end
+
 if __FILE__ == $PROGRAM_NAME
 
-$step_temp = env_has_key("AC_STEP_TEMP")
+#step_temp - AC_STEP_TEMP is set for a marketplace component. A Custom Script
+#            does not get it, so the documented AC_TEMP_DIR is the fallback and
+#            the step keeps its files in its own folder under it.
+$step_temp = get_step_temp()
+
 $repository_path = env_has_key("AC_REPOSITORY_DIR")
 $output_path = ENV["AC_OUTPUT_DIR"]
 $env_file_path = ENV["AC_ENV_FILE_PATH"]
@@ -556,6 +564,8 @@ if $config_path != nil
 else
   puts "No explicit config, a `.mobsf` file at the scan root is picked up automatically"
 end
+
+FileUtils.mkdir_p($step_temp)
 
 create_virtualenv(get_python_executable(), $venv_path)
 install_mobsfscan($venv_path, $mobsfscan_version)

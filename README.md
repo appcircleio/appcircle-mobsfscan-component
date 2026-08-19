@@ -9,9 +9,13 @@ The scope of this component is source code only. Compiled artifact (APK / IPA) a
 handled by the separate MobSF binary scan step.
 
 `mobsfscan` is LGPL-3.0-or-later, so it is not shipped inside Appcircle. The step installs the
-pinned version with pip at runtime, into an isolated virtualenv under `$AC_STEP_TEMP` that is
-discarded when the step ends. **Docker is not required**, the only runner requirement is
-`python3` with the `venv` module.
+pinned version with pip at runtime, into an isolated virtualenv under the step's temp directory,
+which the runner discards when the build ends. **Docker is not required**, the only runner
+requirement is `python3` with the `venv` module.
+
+The temp directory is `$AC_STEP_TEMP` when the step runs as a marketplace component. A Custom
+Script does not get that variable, so the step then falls back to
+`$AC_TEMP_DIR/appcircle_mobsfscan`.
 
 ## Required Inputs
 
@@ -83,8 +87,8 @@ Findings come in two shapes and the console summary keeps them apart:
 
 ## Reports
 
-Reports are written under `$AC_STEP_TEMP` and, when `AC_MOBSFSCAN_SAVE_REPORT` is `true`,
-copied to `$AC_OUTPUT_DIR/mobsfscan_output/`:
+Reports are written under the step's temp directory and, when `AC_MOBSFSCAN_SAVE_REPORT` is
+`true`, copied to `$AC_OUTPUT_DIR/mobsfscan_output/`:
 
 | Format | Filename |
 | --- | --- |
@@ -150,7 +154,7 @@ instead of surfacing a raw pip error.
 
 ## Notes on the runtime install
 
-- The virtualenv is created under `$AC_STEP_TEMP` and never touches the system Python. A global
+- The virtualenv is created under the step's temp directory and never touches the system Python. A global
   or `--user` install is rejected by PEP 668 managed interpreters on macOS runners, and would
   leak into the pinned runner toolchain from the Android container, where the step runs as root.
 - `mobsfscan` shells out to `semgrep` for its pattern matching rules, so the virtualenv's `bin`
