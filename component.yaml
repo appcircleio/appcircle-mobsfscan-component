@@ -73,21 +73,45 @@ inputs:
   helpText:
 outputs:
 - key: "AC_MOBSFSCAN_JSON_REPORT_PATH"
-  description: "Path of the JSON report, when `json` is a requested output format."
+  title: "JSON Report Path"
+  defaultValue: "AC_MOBSFSCAN_JSON_REPORT_PATH"
+  description: "Specifies the path of the JSON report. Only set when `json` is one of the requested output formats."
+  helpText:
 - key: "AC_MOBSFSCAN_SARIF_REPORT_PATH"
-  description: "Path of the SARIF 2.1.0 report, when `sarif` is a requested output format."
+  title: "SARIF Report Path"
+  defaultValue: "AC_MOBSFSCAN_SARIF_REPORT_PATH"
+  description: "Specifies the path of the SARIF 2.1.0 report. Only set when `sarif` is one of the requested output formats."
+  helpText:
 - key: "AC_MOBSFSCAN_REPORT_DIR"
-  description: "Directory holding the generated reports."
+  title: "Report Directory"
+  defaultValue: "AC_MOBSFSCAN_REPORT_DIR"
+  description: "Specifies the directory that holds the generated reports."
+  helpText:
 - key: "AC_MOBSFSCAN_FINDING_COUNT"
-  description: "Total number of findings."
+  title: "Finding Count"
+  defaultValue: "AC_MOBSFSCAN_FINDING_COUNT"
+  description: "Specifies the total number of findings, including the informational missing best practice rules."
+  helpText:
 - key: "AC_MOBSFSCAN_ERROR_COUNT"
-  description: "Number of ERROR severity findings."
+  title: "Error Finding Count"
+  defaultValue: "AC_MOBSFSCAN_ERROR_COUNT"
+  description: "Specifies the number of findings with `ERROR` severity."
+  helpText:
 - key: "AC_MOBSFSCAN_WARNING_COUNT"
-  description: "Number of WARNING severity findings."
+  title: "Warning Finding Count"
+  defaultValue: "AC_MOBSFSCAN_WARNING_COUNT"
+  description: "Specifies the number of findings with `WARNING` severity."
+  helpText:
 - key: "AC_MOBSFSCAN_INFO_COUNT"
-  description: "Number of INFO severity findings."
+  title: "Info Finding Count"
+  defaultValue: "AC_MOBSFSCAN_INFO_COUNT"
+  description: "Specifies the number of findings with `INFO` severity."
+  helpText:
 - key: "AC_MOBSFSCAN_HIGHEST_SEVERITY"
-  description: "Highest reported severity: `ERROR`, `WARNING`, `INFO` or `NONE`."
+  title: "Highest Severity"
+  defaultValue: "AC_MOBSFSCAN_HIGHEST_SEVERITY"
+  description: "Specifies the highest reported severity. One of `ERROR`, `WARNING`, `INFO`, or `NONE` when nothing was reported."
+  helpText:
 processFilename: ruby
 processArguments: '%AC_STEP_TEMP%/main.rb'
 files:
