@@ -24,6 +24,36 @@ SEVERITY_RANK = {"INFO" => 1, "WARNING" => 2, "ERROR" => 3}
 SEVERITY_THRESHOLDS = ["none", "info", "warning", "error"]
 SCAN_TYPES = ["auto", "android", "ios"]
 
+###### Advance Mode (runner provisioned MobSF)
+SCAN_MODES = ["light", "advance"]
+DEFAULT_SCAN_MODE = "light"
+DEFAULT_ADVANCE_TIMEOUT = 1800
+
+# Provisioning (PL-398) puts MobSF here: macOS first, then Linux.
+DEFAULT_MOBSF_PREFIXES = ["/usr/local/appcircle/mobsf", "/opt/appcircle/mobsf"]
+MOBSF_MANIFEST_FILE = "appcircle-mobsf-manifest.json"
+MOBSF_CONTROL_SCRIPT = "mobsf-control.sh"
+MOBSF_REPORT_FILENAME = "mobsf-report.json"
+SOURCE_ZIP_FILENAME = "mobsf-source.zip"
+
+# mobsf-control.sh exit codes.
+MOBSF_EXIT_OK = 0
+MOBSF_EXIT_RUNTIME = 1
+MOBSF_EXIT_USAGE = 2
+MOBSF_EXIT_NOT_PROVISIONED = 3
+
+# MobSF grades findings as high/warning/info/secure/hotspot. Only the first
+# three are failures, and they map onto the severities the gate already uses.
+# `secure` is a passed check and `hotspot` needs manual review, so neither
+# counts towards the threshold.
+MOBSF_SEVERITY_MAP = {"high" => "ERROR", "warning" => "WARNING", "info" => "INFO"}
+MOBSF_NON_FINDING_BUCKETS = ["secure", "hotspot"]
+
+# Kept out of the uploaded zip: MobSF never looks at them and they dominate
+# the archive size.
+ZIP_EXCLUDE_DIRS = [".git", ".svn", ".hg", "node_modules", "Pods", "Carthage",
+                    "build", ".gradle", ".idea", "DerivedData", "__MACOSX"]
+
 # mobsfscan takes a single -o, so every output format needs its own run.
 OUTPUT_FORMATS = {
   "json" => {:flag => "--json", :filename => "mobsfscan.json"},
@@ -369,6 +399,265 @@ def verify_installed_version(venv_path, requested)
   puts "@@[warning] Requested mobsfscan #{requested} but #{installed} is installed."
 end
 
+###### MobSF Discovery (Advance Mode)
+#scan_mode - Options: light, advance
+def get_scan_mode()
+  mode = env_default("AC_MOBSFSCAN_SCAN_MODE", DEFAULT_SCAN_MODE).downcase
+  unless SCAN_MODES.include?(mode)
+    abort_script("Invalid scan mode `#{mode}`. Supported values: #{SCAN_MODES.join(", ")}.")
+  end
+
+  return mode
+end
+
+# The installation prefix comes from the input, then MOBSF_HOME, then the
+# well known provisioning paths. Returns nil when none of them hold a manifest.
+def get_mobsf_prefix()
+  candidates = []
+  configured = env_default("AC_MOBSFSCAN_MOBSF_PREFIX", nil)
+  candidates.push(configured) if configured != nil
+  mobsf_home = env_default("MOBSF_HOME", nil)
+  candidates.push(mobsf_home) if mobsf_home != nil
+  candidates.concat(DEFAULT_MOBSF_PREFIXES)
+
+  candidates.each do |prefix|
+    return prefix if File.file?("#{prefix}/#{MOBSF_MANIFEST_FILE}")
+  end
+
+  return nil
+end
+
+def read_mobsf_manifest(prefix)
+  path = "#{prefix}/#{MOBSF_MANIFEST_FILE}"
+  begin
+    return JSON.parse(File.read(path))
+  rescue JSON::ParserError, Errno::ENOENT => e
+    puts "@@[warning] The MobSF manifest at #{path} could not be read: #{e.message}"
+    return nil
+  end
+end
+
+# mobsf-control.sh ships in the runner package, not under the install prefix,
+# so the runner scripts directory is searched as well.
+def get_mobsf_control(prefix)
+  configured = env_default("AC_MOBSFSCAN_MOBSF_CONTROL", nil)
+  if configured != nil
+    unless File.file?(configured)
+      abort_script("The MobSF control script was not found at #{configured}.")
+    end
+    return configured
+  end
+
+  candidates = ["#{prefix}/scripts/#{MOBSF_CONTROL_SCRIPT}", "#{prefix}/#{MOBSF_CONTROL_SCRIPT}"]
+  runner_root = env_default("AC_RUNNER_DIR", nil)
+  candidates.push("#{runner_root}/scripts/#{MOBSF_CONTROL_SCRIPT}") if runner_root != nil
+  ENV["PATH"].to_s.split(File::PATH_SEPARATOR).each do |dir|
+    candidates.push("#{dir}/#{MOBSF_CONTROL_SCRIPT}")
+  end
+
+  candidates.each { |candidate| return candidate if File.file?(candidate) }
+
+  return nil
+end
+
+# Replicates MobSF's own valid_source_code(): the archive is accepted only when
+# an Android or iOS project sits at its root or exactly one level down.
+# Returning nil here means MobSF would answer "This ZIP Format is not supported",
+# so the step can fall back before paying for a zip and an upload.
+def detect_source_layout(path)
+  layout = detect_source_layout_at(path)
+  return layout if layout != nil
+
+  Dir.glob("#{path}/*").each do |entry|
+    next unless File.directory?(entry)
+
+    layout = detect_source_layout_at(entry)
+    return layout if layout != nil
+  end
+
+  return nil
+end
+
+def detect_source_layout_at(path)
+  if File.file?("#{path}/AndroidManifest.xml") && File.exist?("#{path}/src")
+    return "eclipse"
+  end
+
+  if File.file?("#{path}/app/src/main/AndroidManifest.xml") &&
+     (File.exist?("#{path}/app/src/main/java") || File.exist?("#{path}/app/src/main/kotlin"))
+    return "studio"
+  end
+
+  return "ios" unless Dir.glob("#{path}/*.xcodeproj").empty?
+
+  return nil
+end
+
+###### Source Archive (Advance Mode)
+# python3 is already a requirement of this step, so zipfile is used rather than
+# depending on a `zip` binary being present on every runner image.
+def create_source_zip(source_path, zip_path)
+  puts "Archiving #{source_path} for MobSF"
+  script = <<~PYTHON
+    import os, sys, zipfile
+    source, target, excluded = sys.argv[1], sys.argv[2], set(sys.argv[3].split(","))
+    count = 0
+    with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+        for root, dirs, files in os.walk(source):
+            dirs[:] = [d for d in dirs if d not in excluded]
+            for name in files:
+                full = os.path.join(root, name)
+                if os.path.islink(full):
+                    continue
+                archive.write(full, os.path.relpath(full, source))
+                count += 1
+    print(count)
+  PYTHON
+
+  stdout_str, stderr_str, exit_code = run_command(
+    ["python3", "-c", script, source_path, zip_path, ZIP_EXCLUDE_DIRS.join(",")], true, VENV_TIMEOUT)
+
+  unless exit_code == 0
+    abort_script("The source code could not be archived for MobSF.\n#{stderr_str}")
+  end
+
+  size_mb = (File.size(zip_path).to_f / (1024 * 1024)).round(1)
+  puts "Archived #{stdout_str.strip} file(s), #{size_mb} MB"
+
+  return zip_path
+end
+
+###### Advance Scan
+def get_advance_scan_command(control_script, prefix, zip_path, report_path, timeout)
+  return [control_script, "--action", "scan",
+          "--file", zip_path,
+          "--prefix", prefix,
+          "--output", report_path,
+          "--scan-timeout", "#{timeout}"]
+end
+
+def get_advance_timeout()
+  configured = env_default("AC_MOBSFSCAN_ADVANCE_TIMEOUT", "#{DEFAULT_ADVANCE_TIMEOUT}")
+  timeout = configured.to_i
+  unless timeout > 0
+    abort_script("Invalid advance timeout `#{configured}`. A positive number of seconds is expected.")
+  end
+
+  return timeout
+end
+
+# Translates the control script's documented exit codes into an actionable line.
+def get_advance_failure_message(exit_code, stderr_str)
+  case exit_code
+  when MOBSF_EXIT_NOT_PROVISIONED
+    return "MobSF is installed but the installation is incomplete. Run `setup-mobsf.sh --action status` on the runner."
+  when MOBSF_EXIT_USAGE
+    return "The MobSF control script rejected the arguments the step passed. This is a step bug, please report it."
+  else
+    return "The MobSF scan failed.\n#{stderr_str}"
+  end
+end
+
+# MobSF grades into high/warning/info/secure/hotspot. This normalizes the
+# appsec section onto the same summary shape the light mode produces, so the
+# console summary, the threshold gate and the step outputs stay shared.
+def summarize_mobsf_report(report)
+  findings = {}
+  best_practices = {}
+  totals = {}
+  SEVERITIES.each do |severity|
+    findings[severity] = 0
+    best_practices[severity] = 0
+  end
+
+  appsec = report["appsec"] != nil ? report["appsec"] : {}
+  MOBSF_SEVERITY_MAP.each do |mobsf_severity, severity|
+    entries = appsec[mobsf_severity] != nil ? appsec[mobsf_severity] : []
+    findings[severity] += entries.length
+  end
+
+  total = 0
+  highest = nil
+  SEVERITIES.each do |severity|
+    totals[severity] = findings[severity]
+    total += totals[severity]
+    highest = severity if highest == nil && totals[severity] > 0
+  end
+
+  extras = {}
+  MOBSF_NON_FINDING_BUCKETS.each do |bucket|
+    entries = appsec[bucket] != nil ? appsec[bucket] : []
+    extras[bucket] = entries.length
+  end
+
+  return {
+    :findings => findings,
+    :best_practices => best_practices,
+    :totals => totals,
+    :total => total,
+    :highest => highest,
+    :extras => extras,
+    :security_score => appsec["security_score"],
+    :trackers => appsec["total_trackers"]
+  }
+end
+
+def print_advance_summary(summary, threshold)
+  puts "------------------------------------------------------"
+  puts "MobSF Advance Scan Summary"
+  puts "Security Score : #{summary[:security_score] != nil ? summary[:security_score] : "n/a"}"
+  SEVERITIES.each do |severity|
+    puts "#{severity} : #{summary[:findings][severity]} finding(s)"
+  end
+  MOBSF_NON_FINDING_BUCKETS.each do |bucket|
+    puts "#{bucket.upcase} : #{summary[:extras][bucket]} (not counted towards the threshold)"
+  end
+  puts "Total : #{summary[:total]} finding(s)"
+  puts "Highest Severity : #{summary[:highest] != nil ? summary[:highest] : "none"}"
+  puts "Severity Threshold : #{threshold}"
+  puts "------------------------------------------------------"
+end
+
+# Runs the advance scan. Returns the summary, or nil when the runner cannot
+# serve it, in which case the caller falls back to the light scan.
+def run_advance_scan(prefix, control_script, report_path)
+  layout = detect_source_layout($source_path)
+  if layout == nil
+    puts "@@[warning] #{$source_path} does not look like an Android or iOS project MobSF can read " \
+         "(it expects `app/src/main/AndroidManifest.xml`, `AndroidManifest.xml` plus `src/`, " \
+         "or a `.xcodeproj`, at the root or one level down)."
+    return nil
+  end
+  puts "Detected #{layout} source layout"
+
+  zip_path = "#{$step_temp}/#{SOURCE_ZIP_FILENAME}"
+  create_source_zip($source_path, zip_path)
+
+  command = get_advance_scan_command(control_script, prefix, zip_path, report_path, get_advance_timeout())
+  stdout_str, stderr_str, exit_code = run_command(command, true, get_advance_timeout() + 60)
+  puts stdout_str unless stdout_str.strip.empty?
+
+  unless exit_code == 0
+    if exit_code == MOBSF_EXIT_NOT_PROVISIONED
+      puts "@@[warning] #{get_advance_failure_message(exit_code, stderr_str)}"
+      return nil
+    end
+    abort_script(get_advance_failure_message(exit_code, stderr_str))
+  end
+
+  report = parse_report(report_path)
+
+  # An iOS source archive makes MobSF answer with a redirect marker instead of
+  # a report, so there is nothing to gate on.
+  if report["appsec"] == nil
+    puts "@@[warning] MobSF returned no `appsec` section for this source archive" \
+         "#{report["type"] != nil ? " (type: #{report["type"]})" : ""}, so there is nothing to gate on."
+    return nil
+  end
+
+  return summarize_mobsf_report(report)
+end
+
 ###### Scan
 def get_scan_command(format, output_file)
   command = ["#{$venv_path}/bin/mobsfscan", OUTPUT_FORMATS[format][:flag],
@@ -557,6 +846,65 @@ $output_formats = get_output_formats()
 $scan_timeout = get_scan_timeout()
 $config_path = get_config_path($source_path)
 $extra_parameters = get_extra_parameters()
+$scan_mode = get_scan_mode()
+
+FileUtils.mkdir_p($step_temp)
+FileUtils.mkdir_p($report_path)
+
+### Advance mode uses the MobSF installation provisioned on the runner and
+### scans a zip of the source. It falls back to the light scan whenever the
+### runner cannot serve it, so the step never fails just for being on a runner
+### without MobSF.
+$scan_mode_used = "light"
+
+if $scan_mode == "advance"
+  puts "Advance scan requested, looking for a MobSF installation on this runner"
+  $mobsf_prefix = get_mobsf_prefix()
+
+  if $mobsf_prefix == nil
+    puts "@@[warning] No MobSF installation found (looked for #{MOBSF_MANIFEST_FILE} under " \
+         "#{DEFAULT_MOBSF_PREFIXES.join(", ")}). Falling back to the light scan."
+  else
+    $mobsf_manifest = read_mobsf_manifest($mobsf_prefix)
+    if $mobsf_manifest != nil
+      puts "Found MobSF #{$mobsf_manifest["mobsfVersion"]} at #{$mobsf_prefix}"
+    end
+
+    $mobsf_control = get_mobsf_control($mobsf_prefix)
+    if $mobsf_control == nil
+      puts "@@[warning] MobSF is installed at #{$mobsf_prefix} but #{MOBSF_CONTROL_SCRIPT} was not " \
+           "found. It ships with the runner package. Falling back to the light scan."
+    else
+      $advance_report_path = "#{$report_path}/#{MOBSF_REPORT_FILENAME}"
+      $advance_summary = run_advance_scan($mobsf_prefix, $mobsf_control, $advance_report_path)
+      $scan_mode_used = "advance" if $advance_summary != nil
+      puts "@@[warning] Falling back to the light scan." if $advance_summary == nil
+    end
+  end
+end
+
+if $scan_mode_used == "advance"
+
+print_advance_summary($advance_summary, $severity_threshold)
+
+$export_path = copy_reports($report_path, [MOBSF_REPORT_FILENAME]) if $save_report
+
+$outputs = get_step_outputs($advance_summary, $export_path != nil ? $export_path : $report_path, [])
+$outputs["AC_MOBSFSCAN_SCAN_MODE_USED"] = "advance"
+$outputs["AC_MOBSFSCAN_MOBSF_REPORT_PATH"] = "#{$export_path != nil ? $export_path : $report_path}/#{MOBSF_REPORT_FILENAME}"
+$outputs["AC_MOBSFSCAN_SECURITY_SCORE"] = $advance_summary[:security_score] != nil ? $advance_summary[:security_score] : ""
+write_environment_variables($outputs)
+
+if is_threshold_exceeded($advance_summary, $severity_threshold)
+  abort_script("MobSF found findings at or above the `#{$severity_threshold}` severity " \
+               "threshold. The report is still published as an artifact.")
+end
+
+puts "MobSF advance scan completed without exceeding the severity threshold."
+
+exit 0
+
+end # if $scan_mode_used == "advance"
 
 puts "Scanning #{$source_path} (type: #{$scan_type}, formats: #{$output_formats.join(", ")})"
 if $config_path != nil
@@ -565,12 +913,8 @@ else
   puts "No explicit config, a `.mobsf` file at the scan root is picked up automatically"
 end
 
-FileUtils.mkdir_p($step_temp)
-
 create_virtualenv(get_python_executable(), $venv_path)
 install_mobsfscan($venv_path, $mobsfscan_version)
-
-FileUtils.mkdir_p($report_path)
 
 ### JSON is always produced, it is the report the threshold decision is made
 ### from. It is only published as an artifact when the user asked for it.

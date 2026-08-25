@@ -135,7 +135,8 @@ INPUT_KEYS = %w[
   AC_MOBSFSCAN_OUTPUT_FORMATS AC_MOBSFSCAN_SEVERITY_THRESHOLD
   AC_MOBSFSCAN_CONFIG_PATH AC_MOBSFSCAN_SAVE_REPORT AC_MOBSFSCAN_TIMEOUT
   AC_MOBSFSCAN_EXTRA_PARAMETERS AC_MOBSFSCAN_PIP_INDEX_URL
-  AC_MOBSFSCAN_PIP_FIND_LINKS
+  AC_MOBSFSCAN_PIP_FIND_LINKS AC_MOBSFSCAN_SCAN_MODE AC_MOBSFSCAN_ADVANCE_TIMEOUT
+  AC_MOBSFSCAN_MOBSF_PREFIX AC_MOBSFSCAN_MOBSF_CONTROL MOBSF_HOME AC_RUNNER_DIR
 ].freeze
 
 def reset_inputs
@@ -151,6 +152,8 @@ def reset_inputs
   $extra_parameters = []
   $pip_index_url = nil
   $pip_find_links = nil
+  $scan_mode = nil
+  $step_temp = nil
 end
 
 # abort_script writes to $stderr and raises SystemExit. Returns the message, or
@@ -994,7 +997,323 @@ RSpec.describe '#get_step_outputs' do
   end
 end
 
-# ─── 21. End to end ───────────────────────────────────────────────────────────
+# ─── 21. get_scan_mode ────────────────────────────────────────────────────────
+RSpec.describe '#get_scan_mode' do
+  before { reset_inputs }
+  after { reset_inputs }
+
+  context 'positive path' do
+    it 'defaults to light, which needs nothing on the runner' do
+      expect(get_scan_mode).to eq('light')
+    end
+
+    it 'accepts advance' do
+      ENV['AC_MOBSFSCAN_SCAN_MODE'] = 'Advance'
+      expect(get_scan_mode).to eq('advance')
+    end
+  end
+
+  context 'negative path – unsupported value' do
+    it 'aborts and names the supported values' do
+      ENV['AC_MOBSFSCAN_SCAN_MODE'] = 'deep'
+      message = capture_abort { get_scan_mode }
+      expect(message).to include('deep')
+      expect(message).to include('advance')
+    end
+  end
+end
+
+# ─── 22. get_mobsf_prefix ─────────────────────────────────────────────────────
+RSpec.describe '#get_mobsf_prefix' do
+  before { reset_inputs }
+  after { reset_inputs }
+
+  def with_manifest(dir)
+    File.write(File.join(dir, 'appcircle-mobsf-manifest.json'),
+               JSON.dump({ 'mobsfVersion' => '4.5.2', 'listenPort' => 8000, 'prefix' => dir }))
+  end
+
+  context 'positive path' do
+    it 'uses the configured prefix when it holds a manifest' do
+      Dir.mktmpdir do |prefix|
+        with_manifest(prefix)
+        ENV['AC_MOBSFSCAN_MOBSF_PREFIX'] = prefix
+        expect(get_mobsf_prefix).to eq(prefix)
+      end
+    end
+
+    it 'falls back to MOBSF_HOME' do
+      Dir.mktmpdir do |prefix|
+        with_manifest(prefix)
+        ENV['MOBSF_HOME'] = prefix
+        expect(get_mobsf_prefix).to eq(prefix)
+      end
+    end
+  end
+
+  context 'negative path – nothing provisioned' do
+    it 'returns nil when the configured prefix has no manifest' do
+      Dir.mktmpdir do |prefix|
+        ENV['AC_MOBSFSCAN_MOBSF_PREFIX'] = prefix
+        expect(get_mobsf_prefix).to be_nil
+      end
+    end
+  end
+end
+
+# ─── 23. detect_source_layout ─────────────────────────────────────────────────
+# Mirrors MobSF's valid_source_code(): anything it would reject is detected
+# here first, so the step can fall back instead of paying for a failed upload.
+RSpec.describe '#detect_source_layout' do
+  def studio_project(root, nested: false)
+    base = nested ? File.join(root, 'MyApp') : root
+    FileUtils.mkdir_p(File.join(base, 'app/src/main/java/com/example'))
+    File.write(File.join(base, 'app/src/main/AndroidManifest.xml'), '<manifest/>')
+    root
+  end
+
+  context 'positive path – Android Studio layout' do
+    it 'detects it at the archive root' do
+      Dir.mktmpdir { |root| expect(detect_source_layout(studio_project(root))).to eq('studio') }
+    end
+
+    it 'detects it one level down, the way MobSF relaxes the check' do
+      Dir.mktmpdir { |root| expect(detect_source_layout(studio_project(root, nested: true))).to eq('studio') }
+    end
+
+    it 'accepts a Kotlin only source set' do
+      Dir.mktmpdir do |root|
+        FileUtils.mkdir_p(File.join(root, 'app/src/main/kotlin'))
+        File.write(File.join(root, 'app/src/main/AndroidManifest.xml'), '<manifest/>')
+        expect(detect_source_layout(root)).to eq('studio')
+      end
+    end
+  end
+
+  context 'positive path – Eclipse layout' do
+    it 'detects a manifest beside src/' do
+      Dir.mktmpdir do |root|
+        FileUtils.mkdir_p(File.join(root, 'src'))
+        File.write(File.join(root, 'AndroidManifest.xml'), '<manifest/>')
+        expect(detect_source_layout(root)).to eq('eclipse')
+      end
+    end
+  end
+
+  context 'positive path – iOS layout' do
+    it 'detects an xcodeproj' do
+      Dir.mktmpdir do |root|
+        FileUtils.mkdir_p(File.join(root, 'MyApp.xcodeproj'))
+        expect(detect_source_layout(root)).to eq('ios')
+      end
+    end
+  end
+
+  context 'negative path – layout MobSF cannot read' do
+    it 'returns nil for a bare source tree' do
+      Dir.mktmpdir do |root|
+        FileUtils.mkdir_p(File.join(root, 'src/main/java'))
+        expect(detect_source_layout(root)).to be_nil
+      end
+    end
+
+    it 'returns nil for a manifest with no source set' do
+      Dir.mktmpdir do |root|
+        FileUtils.mkdir_p(File.join(root, 'app/src/main'))
+        File.write(File.join(root, 'app/src/main/AndroidManifest.xml'), '<manifest/>')
+        expect(detect_source_layout(root)).to be_nil
+      end
+    end
+  end
+end
+
+# ─── 24. create_source_zip ────────────────────────────────────────────────────
+RSpec.describe '#create_source_zip' do
+  before { reset_inputs }
+  after { reset_inputs }
+
+  it 'archives the tree and leaves out the excluded directories' do
+    Dir.mktmpdir do |root|
+      FileUtils.mkdir_p(File.join(root, 'app/src/main/java'))
+      File.write(File.join(root, 'app/src/main/java/Main.java'), 'class Main {}')
+      FileUtils.mkdir_p(File.join(root, '.git'))
+      File.write(File.join(root, '.git/config'), 'noise')
+      FileUtils.mkdir_p(File.join(root, 'node_modules/left-pad'))
+      File.write(File.join(root, 'node_modules/left-pad/index.js'), 'noise')
+
+      Dir.mktmpdir do |out|
+        zip_path = File.join(out, 'source.zip')
+        capture_stdout { create_source_zip(root, zip_path) }
+        expect(File.file?(zip_path)).to be true
+
+        listing, = Open3.capture2('python3', '-c',
+                                  'import sys,zipfile;print("\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))',
+                                  zip_path)
+        expect(listing).to include('app/src/main/java/Main.java')
+        expect(listing).not_to include('.git/config')
+        expect(listing).not_to include('node_modules')
+      end
+    end
+  end
+end
+
+# ─── 25. get_advance_scan_command ─────────────────────────────────────────────
+RSpec.describe '#get_advance_scan_command' do
+  let(:command) { get_advance_scan_command('/scripts/mobsf-control.sh', '/prefix', '/tmp/s.zip', '/tmp/r.json', 1800) }
+
+  context 'positive path' do
+    it 'drives mobsf-control.sh rather than the MobSF REST API' do
+      expect(command[0]).to eq('/scripts/mobsf-control.sh')
+      expect(command[command.index('--action'), 2]).to eq(%w[--action scan])
+    end
+
+    it 'passes the archive, prefix, output and timeout' do
+      expect(command[command.index('--file'), 2]).to eq(['--file', '/tmp/s.zip'])
+      expect(command[command.index('--prefix'), 2]).to eq(['--prefix', '/prefix'])
+      expect(command[command.index('--output'), 2]).to eq(['--output', '/tmp/r.json'])
+      expect(command[command.index('--scan-timeout'), 2]).to eq(['--scan-timeout', '1800'])
+    end
+  end
+end
+
+# ─── 26. get_advance_failure_message ──────────────────────────────────────────
+RSpec.describe '#get_advance_failure_message' do
+  context 'positive path – documented exit codes' do
+    it 'points an incomplete installation at setup-mobsf.sh' do
+      expect(get_advance_failure_message(3, '')).to include('setup-mobsf.sh')
+    end
+
+    it 'calls a usage error a step bug' do
+      expect(get_advance_failure_message(2, '')).to include('step bug')
+    end
+
+    it 'reports a runtime failure with the tool output' do
+      expect(get_advance_failure_message(1, 'boom')).to include('boom')
+    end
+  end
+end
+
+# ─── 27. summarize_mobsf_report ───────────────────────────────────────────────
+# MobSF grades high/warning/info/secure/hotspot; the gate reuses the light
+# mode vocabulary, so the appsec section is normalized onto it.
+RSpec.describe '#summarize_mobsf_report' do
+  def appsec_report(appsec)
+    { 'appsec' => appsec }
+  end
+
+  let(:summary) do
+    summarize_mobsf_report(appsec_report(
+                             'security_score' => 67,
+                             'high' => [{ 'title' => 'a' }],
+                             'warning' => [{ 'title' => 'b' }, { 'title' => 'c' }],
+                             'info' => [{ 'title' => 'd' }],
+                             'secure' => [{ 'title' => 'e' }],
+                             'hotspot' => [{ 'title' => 'f' }],
+                             'total_trackers' => 3
+                           ))
+  end
+
+  context 'positive path' do
+    it 'maps high onto ERROR, warning onto WARNING and info onto INFO' do
+      expect(summary[:findings]['ERROR']).to eq(1)
+      expect(summary[:findings]['WARNING']).to eq(2)
+      expect(summary[:findings]['INFO']).to eq(1)
+    end
+
+    it 'keeps the security score and tracker count' do
+      expect(summary[:security_score]).to eq(67)
+      expect(summary[:trackers]).to eq(3)
+    end
+
+    it 'counts secure and hotspot separately, outside the total' do
+      expect(summary[:extras]['secure']).to eq(1)
+      expect(summary[:extras]['hotspot']).to eq(1)
+      expect(summary[:total]).to eq(4)
+    end
+
+    it 'produces the same shape the shared gate reads' do
+      expect(summary[:highest]).to eq('ERROR')
+      expect(is_threshold_exceeded(summary, 'error')).to be true
+      expect(is_threshold_exceeded(summary, 'none')).to be false
+    end
+  end
+
+  context 'negative path – nothing reported' do
+    it 'treats an empty appsec as a clean scan' do
+      summary = summarize_mobsf_report(appsec_report({}))
+      expect(summary[:total]).to eq(0)
+      expect(summary[:highest]).to be_nil
+    end
+
+    # secure and hotspot are not failures, so they must not trip the gate.
+    it 'does not fail the gate on secure or hotspot entries alone' do
+      summary = summarize_mobsf_report(appsec_report('secure' => [{}], 'hotspot' => [{}]))
+      expect(is_threshold_exceeded(summary, 'info')).to be false
+    end
+  end
+end
+
+
+# ─── Fake MobSF Runner Helper ─────────────────────────────────────────────────
+# There is no provisioned MobSF on a dev machine, so the advance path is driven
+# against a stand-in mobsf-control.sh that honours the documented contract:
+# it validates the arguments, writes the report to --output and returns one of
+# the documented exit codes.
+def with_fake_mobsf(report: nil, exit_code: 0)
+  Dir.mktmpdir do |prefix|
+    File.write(File.join(prefix, 'appcircle-mobsf-manifest.json'),
+               JSON.dump({ 'schemaVersion' => 1, 'mobsfVersion' => '4.5.2',
+                           'listenPort' => 8000, 'prefix' => prefix }))
+    control = File.join(prefix, 'mobsf-control.sh')
+    payload = File.join(prefix, 'canned-report.json')
+    File.write(payload, JSON.dump(report)) if report
+
+    File.write(control, <<~SH)
+      #!/bin/sh
+      # Records the invocation, then behaves like mobsf-control.sh --action scan.
+      echo "$@" > "#{prefix}/last-args"
+      output=""
+      file=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --output) output="$2"; shift 2 ;;
+          --file) file="$2"; shift 2 ;;
+          *) shift ;;
+        esac
+      done
+      cp "$file" "#{prefix}/received.zip" 2>/dev/null
+      if [ #{exit_code} -ne 0 ]; then
+        echo "fake mobsf failure" >&2
+        exit #{exit_code}
+      fi
+      cp "#{payload}" "$output"
+      echo "[MobSF] AppSec summary written"
+      exit 0
+    SH
+    FileUtils.chmod(0o755, control)
+
+    yield({ prefix: prefix, control: control,
+            args: -> { File.read(File.join(prefix, 'last-args')).strip },
+            received_zip: File.join(prefix, 'received.zip') })
+  end
+end
+
+def mobsf_report(high: 0, warning: 0, info: 0, secure: 0, hotspot: 0, score: 67)
+  entries = ->(count) { Array.new(count) { |i| { 'title' => "finding #{i}", 'section' => 'code' } } }
+  {
+    'appsec' => {
+      'security_score' => score,
+      'high' => entries.call(high),
+      'warning' => entries.call(warning),
+      'info' => entries.call(info),
+      'secure' => entries.call(secure),
+      'hotspot' => entries.call(hotspot),
+      'total_trackers' => 0
+    }
+  }
+end
+
+# ─── 28. End to end ───────────────────────────────────────────────────────────
 # Runs main.rb the way the runner does, against the deliberately insecure
 # samples. Needs python3 and a reachable Python package index.
 RSpec.describe 'main.rb end to end' do
@@ -1192,6 +1511,141 @@ RSpec.describe 'main.rb end to end' do
         expect(result[:success]).to be false
         expect(result[:stdout] + result[:stderr]).to include('does not exist')
         expect(result[:stdout]).not_to include('Installing mobsfscan')
+      end
+    end
+  end
+end
+
+
+# ─── 29. End to end – advance mode ────────────────────────────────────────────
+RSpec.describe 'main.rb advance mode end to end' do
+  before { skip 'set MOBSFSCAN_E2E=1 to run the end to end tests' unless e2e_enabled? }
+
+  context 'positive path – MobSF provisioned on the runner' do
+    it 'zips the source, drives mobsf-control.sh and reports the advance result' do
+      with_fake_mobsf(report: mobsf_report(warning: 2, info: 1, secure: 3)) do |mobsf|
+        run_main('studio',
+                 'AC_MOBSFSCAN_SCAN_MODE' => 'advance',
+                 'AC_MOBSFSCAN_MOBSF_PREFIX' => mobsf[:prefix],
+                 'AC_MOBSFSCAN_MOBSF_CONTROL' => mobsf[:control]) do |result|
+          expect(result[:success]).to be(true), "step failed:\n#{result[:stdout]}\n#{result[:stderr]}"
+          expect(result[:outputs]['AC_MOBSFSCAN_SCAN_MODE_USED']).to eq('advance')
+          expect(result[:outputs]['AC_MOBSFSCAN_SECURITY_SCORE']).to eq('67')
+          expect(result[:outputs]['AC_MOBSFSCAN_WARNING_COUNT']).to eq('2')
+          expect(result[:outputs]['AC_MOBSFSCAN_HIGHEST_SEVERITY']).to eq('WARNING')
+          expect(File.file?(File.join(result[:output_dir], 'mobsf-report.json'))).to be true
+
+          # It must never install mobsfscan when the advance scan served the build.
+          expect(result[:stdout]).not_to include('Installing mobsfscan')
+        end
+      end
+    end
+
+    it 'passes the documented mobsf-control.sh arguments and a real zip' do
+      with_fake_mobsf(report: mobsf_report) do |mobsf|
+        run_main('studio',
+                 'AC_MOBSFSCAN_SCAN_MODE' => 'advance',
+                 'AC_MOBSFSCAN_MOBSF_PREFIX' => mobsf[:prefix],
+                 'AC_MOBSFSCAN_MOBSF_CONTROL' => mobsf[:control],
+                 'AC_MOBSFSCAN_ADVANCE_TIMEOUT' => '1234') do |result|
+          expect(result[:success]).to be true
+
+          args = mobsf[:args].call
+          expect(args).to include('--action scan')
+          expect(args).to include("--prefix #{mobsf[:prefix]}")
+          expect(args).to include('--scan-timeout 1234')
+
+          listing, = Open3.capture2('python3', '-c',
+                                    'import sys,zipfile;print("\\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))',
+                                    mobsf[:received_zip])
+          expect(listing).to include('app/src/main/AndroidManifest.xml')
+          expect(listing).to include('app/src/main/java/com/example/studio/MainActivity.java')
+        end
+      end
+    end
+
+    it 'fails the build when MobSF findings breach the threshold' do
+      with_fake_mobsf(report: mobsf_report(high: 1, score: 30)) do |mobsf|
+        run_main('studio',
+                 'AC_MOBSFSCAN_SCAN_MODE' => 'advance',
+                 'AC_MOBSFSCAN_SEVERITY_THRESHOLD' => 'error',
+                 'AC_MOBSFSCAN_MOBSF_PREFIX' => mobsf[:prefix],
+                 'AC_MOBSFSCAN_MOBSF_CONTROL' => mobsf[:control]) do |result|
+          expect(result[:success]).to be false
+          expect(result[:stdout] + result[:stderr]).to include('severity threshold')
+          # The report is still published on the failing path.
+          expect(File.file?(File.join(result[:output_dir], 'mobsf-report.json'))).to be true
+        end
+      end
+    end
+  end
+
+  # The whole point of the fallback: asking for advance on a runner without
+  # MobSF must still produce a scan, not a failed build.
+  context 'positive path – falls back to the light scan' do
+    it 'falls back when no MobSF installation is present' do
+      run_main('android',
+               'AC_MOBSFSCAN_SCAN_MODE' => 'advance',
+               'AC_MOBSFSCAN_MOBSF_PREFIX' => '/nonexistent/mobsf') do |result|
+        expect(result[:success]).to be(true), "step failed:\n#{result[:stdout]}\n#{result[:stderr]}"
+        expect(result[:stdout]).to include('No MobSF installation found')
+        expect(result[:outputs]['AC_MOBSFSCAN_SCAN_MODE_USED']).to be_nil
+        expect(File.file?(File.join(result[:output_dir], 'mobsfscan.json'))).to be true
+      end
+    end
+
+    it 'falls back when the source layout is one MobSF cannot read' do
+      with_fake_mobsf(report: mobsf_report) do |mobsf|
+        run_main('android',
+                 'AC_MOBSFSCAN_SCAN_MODE' => 'advance',
+                 'AC_MOBSFSCAN_MOBSF_PREFIX' => mobsf[:prefix],
+                 'AC_MOBSFSCAN_MOBSF_CONTROL' => mobsf[:control]) do |result|
+          expect(result[:success]).to be true
+          expect(result[:stdout]).to include('does not look like an Android or iOS project')
+          expect(File.file?(File.join(result[:output_dir], 'mobsfscan.json'))).to be true
+        end
+      end
+    end
+
+    it 'falls back when the installation is incomplete (exit code 3)' do
+      with_fake_mobsf(exit_code: 3) do |mobsf|
+        run_main('studio',
+                 'AC_MOBSFSCAN_SCAN_MODE' => 'advance',
+                 'AC_MOBSFSCAN_MOBSF_PREFIX' => mobsf[:prefix],
+                 'AC_MOBSFSCAN_MOBSF_CONTROL' => mobsf[:control]) do |result|
+          expect(result[:success]).to be true
+          expect(result[:stdout]).to include('setup-mobsf.sh')
+          expect(result[:stdout]).to include('Falling back to the light scan')
+        end
+      end
+    end
+
+    # An iOS source archive makes MobSF answer with a redirect marker rather
+    # than a report, so there is nothing to gate on.
+    it 'falls back when the report carries no appsec section' do
+      with_fake_mobsf(report: { 'type' => 'ios' }) do |mobsf|
+        run_main('studio',
+                 'AC_MOBSFSCAN_SCAN_MODE' => 'advance',
+                 'AC_MOBSFSCAN_MOBSF_PREFIX' => mobsf[:prefix],
+                 'AC_MOBSFSCAN_MOBSF_CONTROL' => mobsf[:control]) do |result|
+          expect(result[:success]).to be true
+          expect(result[:stdout]).to include('no `appsec` section')
+          expect(result[:stdout]).to include('type: ios')
+        end
+      end
+    end
+  end
+
+  context 'negative path – runtime failure' do
+    it 'fails the build when the MobSF scan itself breaks' do
+      with_fake_mobsf(exit_code: 1) do |mobsf|
+        run_main('studio',
+                 'AC_MOBSFSCAN_SCAN_MODE' => 'advance',
+                 'AC_MOBSFSCAN_MOBSF_PREFIX' => mobsf[:prefix],
+                 'AC_MOBSFSCAN_MOBSF_CONTROL' => mobsf[:control]) do |result|
+          expect(result[:success]).to be false
+          expect(result[:stdout] + result[:stderr]).to include('The MobSF scan failed')
+        end
       end
     end
   end

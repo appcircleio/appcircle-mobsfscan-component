@@ -8,6 +8,54 @@ CWE / OWASP MASVS references.
 The scope of this component is source code only. Compiled artifact (APK / IPA) analysis is
 handled by the separate MobSF binary scan step.
 
+## Scan modes
+
+`AC_MOBSFSCAN_SCAN_MODE` picks how the source is analysed:
+
+| Mode | Engine | Needs on the runner | Adds |
+| --- | --- | --- | --- |
+| `light` (default) | `mobsfscan` CLI, installed at runtime | `python3` only | Rule matches with file, line, CWE and MASVS |
+| `advance` | MobSF provisioned on the runner | A MobSF installation | Manifest and certificate analysis, tracker detection and the AppSec security score |
+
+In `advance` mode the step zips the source, hands the archive to
+`mobsf-control.sh --action scan` and reads the report it writes. That script sources
+`mobsf.env`, starts MobSF on demand, uploads, scans and removes the scan record afterwards, so
+the step never talks to the MobSF REST API and leaves nothing behind on a shared runner.
+
+**Advance falls back to light rather than failing the build.** Asking for `advance` on a runner
+that cannot serve it still produces a scan, with a warning naming the reason:
+
+- no `appcircle-mobsf-manifest.json` under the installation prefix,
+- `mobsf-control.sh` not found,
+- the control script reporting an incomplete installation (exit code `3`),
+- the source layout not being one MobSF reads (below),
+- a report with no `appsec` section to gate on.
+
+Only a genuine MobSF runtime failure (exit code `1`) fails the build.
+
+### Source layout required by advance mode
+
+MobSF accepts a source archive only when an Android or iOS project sits at its root or exactly
+one level down. The step checks this before archiving anything, so an unsupported tree falls
+back to the light scan instead of returning `This ZIP Format is not supported`:
+
+| Layout | Detected by |
+| --- | --- |
+| Android Studio | `app/src/main/AndroidManifest.xml` plus `app/src/main/java` or `.../kotlin` |
+| Eclipse | `AndroidManifest.xml` beside `src/` |
+| iOS | a `*.xcodeproj` |
+
+Point `AC_MOBSFSCAN_SOURCE_PATH` at the project root, not the repository root, when they differ
+— in a React Native or Flutter repository that is `android/`.
+
+`.git`, `node_modules`, `Pods`, `Carthage`, `build`, `.gradle`, `.idea` and `DerivedData` are
+left out of the archive, since MobSF does not read them and they dominate its size.
+
+Two MobSF behaviours worth knowing: an **iOS source archive** makes MobSF answer with a redirect
+marker instead of a report, so advance mode falls back for iOS source; and MobSF's own decompile
+and SAST timeouts are 1000 seconds each, which is why `AC_MOBSFSCAN_ADVANCE_TIMEOUT` defaults to
+`1800`.
+
 `mobsfscan` is LGPL-3.0-or-later, so it is not shipped inside Appcircle. The step installs the
 pinned version with pip at runtime, into an isolated virtualenv under the step's temp directory,
 which the runner discards when the build ends. **Docker is not required**, the only runner
@@ -26,6 +74,16 @@ Script does not get that variable, so the step then falls back to
 
 ## Optional Inputs
 
+- `AC_MOBSFSCAN_SCAN_MODE`: Scan Mode. A dropdown of `light` (default) and `advance`. See
+  [Scan modes](#scan-modes).
+- `AC_MOBSFSCAN_ADVANCE_TIMEOUT`: Advance Scan Timeout. Timeout in seconds for the MobSF scan,
+  default `1800`.
+- `AC_MOBSFSCAN_MOBSF_PREFIX`: MobSF Installation Prefix. Where MobSF is installed on the runner.
+  When empty the step looks at `MOBSF_HOME`, then `/usr/local/appcircle/mobsf` and
+  `/opt/appcircle/mobsf`.
+- `AC_MOBSFSCAN_MOBSF_CONTROL`: MobSF Control Script Path. Path of `mobsf-control.sh`, which
+  ships with the runner package. When empty the step looks under the installation prefix, the
+  runner scripts directory and `PATH`.
 - `AC_MOBSFSCAN_SOURCE_PATH`: Source Path. Path of the source code to scan. A relative value is
   resolved against the cloned repository directory. Defaults to the repository root.
 - `AC_MOBSFSCAN_SCAN_TYPE`: Scan Type. A dropdown of `auto` (default), `android` and `ios`.
@@ -64,6 +122,9 @@ Script does not get that variable, so the step then falls back to
 | `AC_MOBSFSCAN_WARNING_COUNT` | Number of `WARNING` severity findings. |
 | `AC_MOBSFSCAN_INFO_COUNT` | Number of `INFO` severity findings. |
 | `AC_MOBSFSCAN_HIGHEST_SEVERITY` | Highest reported severity, or `NONE`. |
+| `AC_MOBSFSCAN_SCAN_MODE_USED` | Which scan ran, `light` or `advance`. |
+| `AC_MOBSFSCAN_MOBSF_REPORT_PATH` | Path of the MobSF JSON report, advance mode only. |
+| `AC_MOBSFSCAN_SECURITY_SCORE` | MobSF AppSec security score, advance mode only. |
 
 ## How the step decides success or failure
 
@@ -75,6 +136,10 @@ alone cannot tell a failed build from a failed tool. The step therefore runs `mo
 2. **Findings below the threshold, or `none`** — the step succeeds, and the reports are published.
 3. **No parseable report, or a non-zero exit code** — `mobsfscan` itself failed. The step fails
    with a different message, so a tool problem is never read as a policy violation.
+
+Advance mode uses the same gate. MobSF grades findings as `high / warning / info / secure /
+hotspot`, which the step maps onto `ERROR / WARNING / INFO`; `secure` is a passed check and
+`hotspot` needs manual review, so neither counts towards the threshold.
 
 Severities are `ERROR`, `WARNING` and `INFO`. The JSON report is always generated because the
 threshold decision is made from it, but it is only published as an artifact when `json` is one
