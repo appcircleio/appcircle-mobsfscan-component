@@ -448,16 +448,51 @@ def get_mobsf_control(prefix)
     return configured
   end
 
-  candidates = ["#{prefix}/scripts/#{MOBSF_CONTROL_SCRIPT}", "#{prefix}/#{MOBSF_CONTROL_SCRIPT}"]
-  runner_root = env_default("AC_RUNNER_DIR", nil)
-  candidates.push("#{runner_root}/scripts/#{MOBSF_CONTROL_SCRIPT}") if runner_root != nil
+  get_mobsf_control_candidates(prefix).each do |candidate|
+    return candidate if File.file?(candidate)
+  end
+
+  return nil
+end
+
+# mobsf-control.sh ships with the runner package rather than under the MobSF
+# installation prefix, and the runner directory is not exposed as a build
+# variable. A dev macOS runner has MobSF at /usr/local/appcircle/mobsf and the
+# script one level up, so every ancestor of the prefix and of the step's own
+# working directory is checked for a scripts/ directory.
+def get_mobsf_control_candidates(prefix)
+  candidates = ["#{prefix}/#{MOBSF_CONTROL_SCRIPT}"]
+
+  roots = [prefix, $step_temp, env_default("AC_TEMP_DIR", nil), env_default("AC_RUNNER_DIR", nil)]
+  roots.compact.each do |root|
+    ancestor_directories(root).each do |dir|
+      candidates.push("#{dir}/scripts/#{MOBSF_CONTROL_SCRIPT}")
+    end
+  end
+
   ENV["PATH"].to_s.split(File::PATH_SEPARATOR).each do |dir|
+    next if dir.empty?
+
     candidates.push("#{dir}/#{MOBSF_CONTROL_SCRIPT}")
   end
 
-  candidates.each { |candidate| return candidate if File.file?(candidate) }
+  return candidates.uniq
+end
 
-  return nil
+# The path itself and each of its parents, bounded so a pathological path
+# cannot spin.
+def ancestor_directories(path, limit = 12)
+  directories = []
+  current = File.expand_path(path)
+  limit.times do
+    directories.push(current)
+    parent = File.dirname(current)
+    break if parent == current
+
+    current = parent
+  end
+
+  return directories
 end
 
 # Replicates MobSF's own valid_source_code(): the archive is accepted only when
@@ -873,7 +908,11 @@ if $scan_mode == "advance"
     $mobsf_control = get_mobsf_control($mobsf_prefix)
     if $mobsf_control == nil
       puts "@@[warning] MobSF is installed at #{$mobsf_prefix} but #{MOBSF_CONTROL_SCRIPT} was not " \
-           "found. It ships with the runner package. Falling back to the light scan."
+           "found. It ships with the runner package, not with the MobSF installation. Set the " \
+           "`AC_MOBSFSCAN_MOBSF_CONTROL` input to its full path to use the advance scan. " \
+           "Searched #{get_mobsf_control_candidates($mobsf_prefix).length} locations under " \
+           "#{[$mobsf_prefix, $step_temp].compact.join(", ")} and PATH."
+      puts "@@[warning] Falling back to the light scan."
     else
       $advance_report_path = "#{$report_path}/#{MOBSF_REPORT_FILENAME}"
       $advance_summary = run_advance_scan($mobsf_prefix, $mobsf_control, $advance_report_path)

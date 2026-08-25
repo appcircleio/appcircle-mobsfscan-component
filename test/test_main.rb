@@ -1061,6 +1061,80 @@ RSpec.describe '#get_mobsf_prefix' do
   end
 end
 
+# ─── 22b. get_mobsf_control ───────────────────────────────────────────────────
+# The script ships with the runner package, not under the MobSF prefix, so the
+# search walks up from the prefix and the step's working directory. A dev macOS
+# runner has MobSF at /usr/local/appcircle/mobsf with the script one level up.
+RSpec.describe '#get_mobsf_control' do
+  before { reset_inputs }
+  after { reset_inputs }
+
+  def install_control(dir)
+    FileUtils.mkdir_p(dir)
+    path = File.join(dir, 'mobsf-control.sh')
+    File.write(path, "#!/bin/sh\nexit 0\n")
+    FileUtils.chmod(0o755, path)
+    path
+  end
+
+  context 'positive path – found on the runner' do
+    it 'finds the script in a scripts/ directory beside the prefix' do
+      Dir.mktmpdir do |root|
+        prefix = File.join(root, 'appcircle/mobsf')
+        FileUtils.mkdir_p(prefix)
+        expected = install_control(File.join(root, 'appcircle/scripts'))
+        expect(get_mobsf_control(prefix)).to eq(expected)
+      end
+    end
+
+    it 'finds the script under the prefix itself' do
+      Dir.mktmpdir do |root|
+        prefix = File.join(root, 'mobsf')
+        FileUtils.mkdir_p(prefix)
+        expected = install_control(File.join(prefix, 'scripts'))
+        expect(get_mobsf_control(prefix)).to eq(expected)
+      end
+    end
+
+    it 'finds the script from the step working directory when the prefix has none' do
+      Dir.mktmpdir do |root|
+        prefix = File.join(root, 'elsewhere/mobsf')
+        FileUtils.mkdir_p(prefix)
+        $step_temp = File.join(root, 'runner/work/step_tmp')
+        FileUtils.mkdir_p($step_temp)
+        expected = install_control(File.join(root, 'runner/scripts'))
+        expect(get_mobsf_control(prefix)).to eq(expected)
+      end
+    end
+
+    it 'prefers the explicitly configured path' do
+      Dir.mktmpdir do |root|
+        prefix = File.join(root, 'mobsf')
+        install_control(File.join(prefix, 'scripts'))
+        explicit = install_control(File.join(root, 'custom'))
+        ENV['AC_MOBSFSCAN_MOBSF_CONTROL'] = explicit
+        expect(get_mobsf_control(prefix)).to eq(explicit)
+      end
+    end
+  end
+
+  context 'negative path' do
+    it 'returns nil when the script is nowhere to be found' do
+      Dir.mktmpdir do |root|
+        prefix = File.join(root, 'a/b/c/mobsf')
+        FileUtils.mkdir_p(prefix)
+        $step_temp = prefix
+        expect(get_mobsf_control(prefix)).to be_nil
+      end
+    end
+
+    it 'aborts when the configured path does not exist' do
+      ENV['AC_MOBSFSCAN_MOBSF_CONTROL'] = '/nope/mobsf-control.sh'
+      expect(capture_abort { get_mobsf_control('/prefix') }).to include('was not found')
+    end
+  end
+end
+
 # ─── 23. detect_source_layout ─────────────────────────────────────────────────
 # Mirrors MobSF's valid_source_code(): anything it would reject is detected
 # here first, so the step can fall back instead of paying for a failed upload.
