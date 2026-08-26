@@ -989,8 +989,8 @@ RSpec.describe '#get_step_outputs' do
     it 'exports the counts and the highest severity' do
       outputs = get_step_outputs(summary, '/reports', %w[sarif json])
       expect(outputs['AC_MOBSFSCAN_FINDING_COUNT']).to eq(1)
-      expect(outputs['AC_MOBSFSCAN_ERROR_COUNT']).to eq(1)
-      expect(outputs['AC_MOBSFSCAN_HIGHEST_SEVERITY']).to eq('ERROR')
+      expect(outputs['AC_MOBSFSCAN_CRITICAL_COUNT']).to eq(1)
+      expect(outputs['AC_MOBSFSCAN_WORST_LEVEL']).to eq('critical')
     end
 
     it 'exports the report paths for the requested formats' do
@@ -1006,7 +1006,7 @@ RSpec.describe '#get_step_outputs' do
 
     it 'reports NONE as the highest severity for a clean scan' do
       outputs = get_step_outputs(summarize_report(build_report({})), '/reports', %w[json])
-      expect(outputs['AC_MOBSFSCAN_HIGHEST_SEVERITY']).to eq('NONE')
+      expect(outputs['AC_MOBSFSCAN_WORST_LEVEL']).to eq('none')
     end
   end
 end
@@ -1441,7 +1441,7 @@ RSpec.describe 'main.rb end to end' do
         expect(result[:outputs]['AC_MOBSFSCAN_SARIF_REPORT_PATH'])
           .to eq(File.join(result[:output_dir], 'mobsfscan.sarif'))
         expect(result[:outputs]['AC_MOBSFSCAN_FINDING_COUNT'].to_i).to be > 0
-        expect(%w[ERROR WARNING INFO]).to include(result[:outputs]['AC_MOBSFSCAN_HIGHEST_SEVERITY'])
+        expect(%w[critical normal low]).to include(result[:outputs]['AC_MOBSFSCAN_WORST_LEVEL'])
       end
     end
 
@@ -1491,7 +1491,7 @@ RSpec.describe 'main.rb end to end' do
         matched = read_json_report(result, 'mobsfscan.json')['results']
                   .reject { |_id, detail| (detail['files'] || []).empty? }
         expect(matched).to be_empty
-        expect(result[:outputs]['AC_MOBSFSCAN_ERROR_COUNT']).to eq('0')
+        expect(result[:outputs]['AC_MOBSFSCAN_CRITICAL_COUNT']).to eq('0')
       end
     end
   end
@@ -1527,15 +1527,15 @@ RSpec.describe 'main.rb end to end' do
     it 'fails the build at the default critical gate' do
       run_main('android', 'AC_MOBSFSCAN_SEVERITY_THRESHOLD' => nil) do |result|
         expect(result[:success]).to be false
-        expect(result[:stdout] + result[:stderr]).to include('at or above the `critical` severity threshold')
-        expect(result[:outputs]['AC_MOBSFSCAN_HIGHEST_SEVERITY']).to eq('ERROR')
+        expect(result[:stdout] + result[:stderr]).to include('`critical` finding or worse')
+        expect(result[:outputs]['AC_MOBSFSCAN_WORST_LEVEL']).to eq('critical')
       end
     end
 
     it 'fails at the normal gate and still publishes the report' do
       run_main('android', 'AC_MOBSFSCAN_SEVERITY_THRESHOLD' => 'normal') do |result|
         expect(result[:success]).to be false
-        expect(result[:stdout] + result[:stderr]).to include('severity threshold')
+        expect(result[:stdout] + result[:stderr]).to include('breaks the')
         expect(File.file?(File.join(result[:output_dir], 'mobsfscan.json'))).to be true
       end
     end
@@ -1599,8 +1599,8 @@ RSpec.describe 'main.rb advance mode end to end' do
         expect(result[:success]).to be(true), "step failed:\n#{result[:stdout]}\n#{result[:stderr]}"
         expect(result[:outputs]['AC_MOBSFSCAN_SCAN_MODE_USED']).to eq('advance')
         expect(result[:outputs]['AC_MOBSFSCAN_SECURITY_SCORE']).to eq('67')
-        expect(result[:outputs]['AC_MOBSFSCAN_WARNING_COUNT']).to eq('2')
-        expect(result[:outputs]['AC_MOBSFSCAN_HIGHEST_SEVERITY']).to eq('WARNING')
+        expect(result[:outputs]['AC_MOBSFSCAN_NORMAL_COUNT']).to eq('2')
+        expect(result[:outputs]['AC_MOBSFSCAN_WORST_LEVEL']).to eq('normal')
         expect(File.file?(File.join(result[:output_dir], 'mobsf-report.json'))).to be true
 
         # It must never install mobsfscan when the advance scan served the build.
@@ -1634,7 +1634,7 @@ RSpec.describe 'main.rb advance mode end to end' do
                { 'AC_MOBSFSCAN_SCAN_MODE' => 'advance', 'AC_MOBSFSCAN_SEVERITY_THRESHOLD' => 'critical' },
                { report: mobsf_report(high: 1, score: 30) }) do |result|
         expect(result[:success]).to be false
-        expect(result[:stdout] + result[:stderr]).to include('severity threshold')
+        expect(result[:stdout] + result[:stderr]).to include('breaks the')
         # The report is still published on the failing path.
         expect(File.file?(File.join(result[:output_dir], 'mobsf-report.json'))).to be true
       end

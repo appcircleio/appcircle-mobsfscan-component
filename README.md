@@ -49,17 +49,28 @@ from the runner.
 ## Output Variables
 
 - `AC_MOBSFSCAN_SCAN_MODE_USED`: Which scan ran, `light` or `advance`.
-- `AC_MOBSFSCAN_REPORT_DIR`: Directory holding the generated reports.
 - `AC_MOBSFSCAN_SARIF_REPORT_PATH` / `AC_MOBSFSCAN_JSON_REPORT_PATH`: Report paths, when that
   format was requested.
-- `AC_MOBSFSCAN_MOBSF_REPORT_PATH` / `AC_MOBSFSCAN_SECURITY_SCORE`: MobSF report path and
-  AppSec score, set only when the advance scan ran.
-- `AC_MOBSFSCAN_FINDING_COUNT`, `AC_MOBSFSCAN_ERROR_COUNT` (critical),
-  `AC_MOBSFSCAN_WARNING_COUNT` (normal), `AC_MOBSFSCAN_INFO_COUNT` (low),
-  `AC_MOBSFSCAN_HIGHEST_SEVERITY`: Finding counts and the highest reported severity, or `NONE`.
+- `AC_MOBSFSCAN_MOBSF_REPORT_PATH` / `AC_MOBSFSCAN_SECURITY_SCORE`: MobSF report path and the
+  score out of 100, set only when the advance scan ran.
+- `AC_MOBSFSCAN_FINDING_COUNT`, `AC_MOBSFSCAN_CRITICAL_COUNT`, `AC_MOBSFSCAN_NORMAL_COUNT`,
+  `AC_MOBSFSCAN_LOW_COUNT`: Finding counts per level.
+- `AC_MOBSFSCAN_WORST_LEVEL`: `critical`, `normal`, `low`, or `none`.
 
 Reports are copied to `$AC_OUTPUT_DIR/mobsfscan_output/`, so add Export Build Artifacts after
 this step. They are published on the failing path too.
+
+The build log closes with a summary in the same words the form uses, ending in the verdict:
+
+```
+  Critical              6 finding(s)
+  Normal                3 finding(s)
+  Low                   1 finding(s)
+  Total                 10 finding(s)
+  Worst level found     Critical
+  Fail build on         critical
+  Verdict               pipeline breaks
+```
 
 ## Air gapped runners
 

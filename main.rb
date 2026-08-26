@@ -26,6 +26,11 @@ SEVERITY_RANK = {"INFO" => 1, "WARNING" => 2, "ERROR" => 3}
 # severities the two engines report. `none` never fails the build.
 SEVERITY_THRESHOLDS = ["critical", "normal", "low", "none"]
 THRESHOLD_SEVERITY = {"critical" => "ERROR", "normal" => "WARNING", "low" => "INFO"}
+# Both engines grade internally as ERROR/WARNING/INFO. The build log speaks the
+# same words the step form offers instead, so the level a user picked and the
+# level they read back are the same.
+SEVERITY_LABEL = {"ERROR" => "Critical", "WARNING" => "Normal", "INFO" => "Low"}
+
 SCAN_TYPES = ["auto", "android", "ios"]
 
 ###### Scan Mode
@@ -490,23 +495,32 @@ def build_summary(findings, best_practices)
   }
 end
 
+def print_summary_line(label, value)
+  puts "  #{label.ljust(22)}#{value}"
+end
+
 def print_summary(title, summary, threshold)
   puts "------------------------------------------------------"
   puts title
-  puts "Security Score : #{summary[:security_score]}" if summary[:security_score] != nil
+  print_summary_line("Security score", "#{summary[:security_score]} / 100") if summary[:security_score] != nil
+
   SEVERITIES.each do |severity|
-    line = "#{severity} : #{summary[:findings][severity]} finding(s)"
-    line += ", #{summary[:best_practices][severity]} missing best practice(s)" if summary[:extras] == nil
-    puts line
-  end
-  if summary[:extras] != nil
-    summary[:extras].each do |bucket, count|
-      puts "#{bucket.upcase} : #{count} (not counted towards the threshold)"
+    value = "#{summary[:findings][severity]} finding(s)"
+    if summary[:extras] == nil && summary[:best_practices][severity] > 0
+      value += " + #{summary[:best_practices][severity]} missing best practice(s)"
     end
+    print_summary_line(SEVERITY_LABEL[severity], value)
   end
-  puts "Total : #{summary[:total]} finding(s)"
-  puts "Highest Severity : #{summary[:highest] != nil ? summary[:highest] : "none"}"
-  puts "Severity Threshold : #{threshold}"
+
+  if summary[:extras] != nil
+    print_summary_line("Passed checks", "#{summary[:extras]["secure"]}")
+    print_summary_line("Needs review", "#{summary[:extras]["hotspot"]}")
+  end
+
+  print_summary_line("Total", "#{summary[:total]} finding(s)")
+  print_summary_line("Worst level found", summary[:highest] != nil ? SEVERITY_LABEL[summary[:highest]] : "none")
+  print_summary_line("Fail build on", threshold == "none" ? "none (report only)" : threshold)
+  print_summary_line("Verdict", is_threshold_exceeded(summary, threshold) ? "pipeline breaks" : "pipeline continues")
   puts "------------------------------------------------------"
 end
 
@@ -583,22 +597,21 @@ def publish_and_finish(mode, summary, filenames, formats)
   write_environment_variables(outputs)
 
   if is_threshold_exceeded(summary, $severity_threshold)
-    abort_script("#{tool} found findings at or above the `#{$severity_threshold}` severity " \
-                 "threshold. The reports are still published as artifacts.")
+    abort_script("#{tool} found a `#{$severity_threshold}` finding or worse, which breaks the " \
+                 "pipeline. The reports are still published as artifacts.")
   end
 
-  puts "#{tool} completed without exceeding the severity threshold."
+  puts "#{tool} found nothing at or above `#{$severity_threshold}`, the pipeline continues."
   exit 0
 end
 
 def get_step_outputs(summary, report_dir, formats)
   outputs = {
-    "AC_MOBSFSCAN_REPORT_DIR" => report_dir,
     "AC_MOBSFSCAN_FINDING_COUNT" => summary[:total],
-    "AC_MOBSFSCAN_ERROR_COUNT" => summary[:totals]["ERROR"],
-    "AC_MOBSFSCAN_WARNING_COUNT" => summary[:totals]["WARNING"],
-    "AC_MOBSFSCAN_INFO_COUNT" => summary[:totals]["INFO"],
-    "AC_MOBSFSCAN_HIGHEST_SEVERITY" => summary[:highest] != nil ? summary[:highest] : "NONE"
+    "AC_MOBSFSCAN_CRITICAL_COUNT" => summary[:totals]["ERROR"],
+    "AC_MOBSFSCAN_NORMAL_COUNT" => summary[:totals]["WARNING"],
+    "AC_MOBSFSCAN_LOW_COUNT" => summary[:totals]["INFO"],
+    "AC_MOBSFSCAN_WORST_LEVEL" => summary[:highest] != nil ? SEVERITY_LABEL[summary[:highest]].downcase : "none"
   }
 
   formats.each do |format|
