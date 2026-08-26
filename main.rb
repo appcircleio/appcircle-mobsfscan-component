@@ -3,7 +3,6 @@ require 'open3'
 require 'pathname'
 require 'fileutils'
 require 'shellwords'
-require 'English'
 
 ###### Defaults & Constants
 DEFAULT_MOBSFSCAN_VERSION = "1.0.0"
@@ -36,9 +35,7 @@ MOBSF_CONTROL_SCRIPT = "mobsf-control.sh"
 MOBSF_REPORT_FILENAME = "mobsf-report.json"
 SOURCE_ZIP_FILENAME = "mobsf-source.zip"
 
-# mobsf-control.sh exit codes.
-MOBSF_EXIT_OK = 0
-MOBSF_EXIT_RUNTIME = 1
+# mobsf-control.sh exit codes that the step reacts to.
 MOBSF_EXIT_USAGE = 2
 MOBSF_EXIT_NOT_PROVISIONED = 3
 
@@ -208,24 +205,50 @@ def get_source_path()
   return source_path
 end
 
-#scan_type - Options: auto, android, ios
-def get_scan_type()
-  scan_type = env_default("AC_MOBSFSCAN_SCAN_TYPE", DEFAULT_SCAN_TYPE).downcase
-  unless SCAN_TYPES.include?(scan_type)
-    abort_script("Invalid scan type `#{scan_type}`. Supported values: #{SCAN_TYPES.join(", ")}.")
+# Every enumerated input is read the same way: the value is lower cased and
+# has to be one of the options the step form offers.
+def get_enum_input(key, default, allowed, label)
+  value = env_default(key, default).downcase
+  unless allowed.include?(value)
+    abort_script("Invalid #{label} `#{value}`. Supported values: #{allowed.join(", ")}.")
   end
 
-  return scan_type
+  return value
+end
+
+def get_positive_number_input(key, default, label)
+  configured = env_default(key, "#{default}")
+  number = configured.to_i
+  unless number > 0
+    abort_script("Invalid #{label} `#{configured}`. A positive number of seconds is expected.")
+  end
+
+  return number
+end
+
+#scan_type - Options: auto, android, ios
+def get_scan_type()
+  return get_enum_input("AC_MOBSFSCAN_SCAN_TYPE", DEFAULT_SCAN_TYPE, SCAN_TYPES, "scan type")
 end
 
 #severity_threshold - Options: none, info, warning, error
 def get_severity_threshold()
-  threshold = env_default("AC_MOBSFSCAN_SEVERITY_THRESHOLD", DEFAULT_SEVERITY_THRESHOLD).downcase
-  unless SEVERITY_THRESHOLDS.include?(threshold)
-    abort_script("Invalid severity threshold `#{threshold}`. Supported values: #{SEVERITY_THRESHOLDS.join(", ")}.")
-  end
+  return get_enum_input("AC_MOBSFSCAN_SEVERITY_THRESHOLD", DEFAULT_SEVERITY_THRESHOLD,
+                        SEVERITY_THRESHOLDS, "severity threshold")
+end
 
-  return threshold
+#scan_mode - Options: light, advance
+def get_scan_mode()
+  return get_enum_input("AC_MOBSFSCAN_SCAN_MODE", DEFAULT_SCAN_MODE, SCAN_MODES, "scan mode")
+end
+
+def get_scan_timeout()
+  return get_positive_number_input("AC_MOBSFSCAN_TIMEOUT", DEFAULT_SCAN_TIMEOUT, "timeout")
+end
+
+def get_advance_timeout()
+  return get_positive_number_input("AC_MOBSFSCAN_ADVANCE_TIMEOUT", DEFAULT_ADVANCE_TIMEOUT,
+                                   "advance timeout")
 end
 
 #output_formats - Options: sarif, json, html, sonarqube, gitlab-sast
@@ -247,16 +270,6 @@ def get_output_formats()
   abort_script("At least one output format is required.") if formats.empty?
 
   return formats
-end
-
-def get_scan_timeout()
-  configured = env_default("AC_MOBSFSCAN_TIMEOUT", "#{DEFAULT_SCAN_TIMEOUT}")
-  timeout = configured.to_i
-  unless timeout > 0
-    abort_script("Invalid timeout `#{configured}`. A positive number of seconds is expected.")
-  end
-
-  return timeout
 end
 
 # When the config input is empty, mobsfscan discovers a `.mobsf` file at the
@@ -400,16 +413,6 @@ def verify_installed_version(venv_path, requested)
 end
 
 ###### MobSF Discovery (Advance Mode)
-#scan_mode - Options: light, advance
-def get_scan_mode()
-  mode = env_default("AC_MOBSFSCAN_SCAN_MODE", DEFAULT_SCAN_MODE).downcase
-  unless SCAN_MODES.include?(mode)
-    abort_script("Invalid scan mode `#{mode}`. Supported values: #{SCAN_MODES.join(", ")}.")
-  end
-
-  return mode
-end
-
 # The installation prefix comes from MOBSF_HOME, then the well known
 # provisioning paths. Returns nil when none of them hold a manifest.
 def get_mobsf_prefix()
@@ -569,16 +572,6 @@ def get_advance_scan_command(control_script, prefix, zip_path, report_path, time
           "--scan-timeout", "#{timeout}"]
 end
 
-def get_advance_timeout()
-  configured = env_default("AC_MOBSFSCAN_ADVANCE_TIMEOUT", "#{DEFAULT_ADVANCE_TIMEOUT}")
-  timeout = configured.to_i
-  unless timeout > 0
-    abort_script("Invalid advance timeout `#{configured}`. A positive number of seconds is expected.")
-  end
-
-  return timeout
-end
-
 # Translates the control script's documented exit codes into an actionable line.
 def get_advance_failure_message(exit_code, stderr_str)
   case exit_code
@@ -595,60 +588,48 @@ end
 # appsec section onto the same summary shape the light mode produces, so the
 # console summary, the threshold gate and the step outputs stay shared.
 def summarize_mobsf_report(report)
-  findings = {}
-  best_practices = {}
-  totals = {}
-  SEVERITIES.each do |severity|
-    findings[severity] = 0
-    best_practices[severity] = 0
-  end
-
   appsec = report["appsec"] != nil ? report["appsec"] : {}
+  findings = new_severity_counter()
   MOBSF_SEVERITY_MAP.each do |mobsf_severity, severity|
-    entries = appsec[mobsf_severity] != nil ? appsec[mobsf_severity] : []
-    findings[severity] += entries.length
+    findings[severity] += bucket_length(appsec, mobsf_severity)
   end
 
-  total = 0
-  highest = nil
-  SEVERITIES.each do |severity|
-    totals[severity] = findings[severity]
-    total += totals[severity]
-    highest = severity if highest == nil && totals[severity] > 0
-  end
-
+  summary = build_summary(findings, new_severity_counter())
   extras = {}
-  MOBSF_NON_FINDING_BUCKETS.each do |bucket|
-    entries = appsec[bucket] != nil ? appsec[bucket] : []
-    extras[bucket] = entries.length
-  end
+  MOBSF_NON_FINDING_BUCKETS.each { |bucket| extras[bucket] = bucket_length(appsec, bucket) }
 
-  return {
-    :findings => findings,
-    :best_practices => best_practices,
-    :totals => totals,
-    :total => total,
-    :highest => highest,
-    :extras => extras,
-    :security_score => appsec["security_score"],
-    :trackers => appsec["total_trackers"]
-  }
+  summary[:extras] = extras
+  summary[:security_score] = appsec["security_score"]
+  summary[:trackers] = appsec["total_trackers"]
+
+  return summary
 end
 
-def print_advance_summary(summary, threshold)
-  puts "------------------------------------------------------"
-  puts "MobSF Advance Scan Summary"
-  puts "Security Score : #{summary[:security_score] != nil ? summary[:security_score] : "n/a"}"
-  SEVERITIES.each do |severity|
-    puts "#{severity} : #{summary[:findings][severity]} finding(s)"
+# Locates the provisioned MobSF and scans with it. Returns the summary, or nil
+# when this runner cannot serve an advance scan, which sends the step to the
+# light scan rather than failing the build.
+def try_advance_scan()
+  puts "Advance scan requested, looking for a MobSF installation on this runner"
+  prefix = get_mobsf_prefix()
+  if prefix == nil
+    puts "@@[warning] No MobSF installation found (looked for #{MOBSF_MANIFEST_FILE} under " \
+         "#{DEFAULT_MOBSF_PREFIXES.join(", ")})."
+    return nil
   end
-  MOBSF_NON_FINDING_BUCKETS.each do |bucket|
-    puts "#{bucket.upcase} : #{summary[:extras][bucket]} (not counted towards the threshold)"
+
+  manifest = read_mobsf_manifest(prefix)
+  puts "Found MobSF #{manifest["mobsfVersion"]} at #{prefix}" if manifest != nil
+
+  control = get_mobsf_control(prefix)
+  if control == nil
+    puts "@@[warning] MobSF is installed at #{prefix} but #{MOBSF_CONTROL_SCRIPT} was not found " \
+         "in the #{get_mobsf_control_candidates(prefix).length} locations searched under " \
+         "#{[prefix, $step_temp].compact.join(", ")} and PATH. It ships with the runner package, " \
+         "so this runner may predate it."
+    return nil
   end
-  puts "Total : #{summary[:total]} finding(s)"
-  puts "Highest Severity : #{summary[:highest] != nil ? summary[:highest] : "none"}"
-  puts "Severity Threshold : #{threshold}"
-  puts "------------------------------------------------------"
+
+  return run_advance_scan(prefix, control, "#{$report_path}/#{MOBSF_REPORT_FILENAME}")
 end
 
 # Runs the advance scan. Returns the summary, or nil when the runner cannot
@@ -752,16 +733,11 @@ end
 # File level matches and "missing best practice" rules are counted separately:
 # best practice rules carry no file location and always report on a project.
 def summarize_report(report)
-  findings = {}
-  best_practices = {}
-  totals = {}
-  SEVERITIES.each do |severity|
-    findings[severity] = 0
-    best_practices[severity] = 0
-  end
+  findings = new_severity_counter()
+  best_practices = new_severity_counter()
 
   results = report["results"] != nil ? report["results"] : {}
-  results.each do |rule_id, detail|
+  results.each_value do |detail|
     severity = detail["metadata"] != nil ? detail["metadata"]["severity"] : nil
     severity = "INFO" unless SEVERITIES.include?(severity)
     files = detail["files"] != nil ? detail["files"] : []
@@ -773,6 +749,23 @@ def summarize_report(report)
     end
   end
 
+  return build_summary(findings, best_practices)
+end
+
+def new_severity_counter()
+  counter = {}
+  SEVERITIES.each { |severity| counter[severity] = 0 }
+  return counter
+end
+
+def bucket_length(appsec, bucket)
+  return appsec[bucket] != nil ? appsec[bucket].length : 0
+end
+
+# Both modes report through the same shape, so the console summary, the
+# threshold gate and the step outputs are shared.
+def build_summary(findings, best_practices)
+  totals = {}
   total = 0
   highest = nil
   SEVERITIES.each do |severity|
@@ -790,12 +783,19 @@ def summarize_report(report)
   }
 end
 
-def print_summary(summary, threshold)
+def print_summary(title, summary, threshold)
   puts "------------------------------------------------------"
-  puts "mobsfscan Summary"
+  puts title
+  puts "Security Score : #{summary[:security_score]}" if summary[:security_score] != nil
   SEVERITIES.each do |severity|
-    puts "#{severity} : #{summary[:findings][severity]} finding(s), " \
-         "#{summary[:best_practices][severity]} missing best practice(s)"
+    line = "#{severity} : #{summary[:findings][severity]} finding(s)"
+    line += ", #{summary[:best_practices][severity]} missing best practice(s)" if summary[:extras] == nil
+    puts line
+  end
+  if summary[:extras] != nil
+    summary[:extras].each do |bucket, count|
+      puts "#{bucket.upcase} : #{count} (not counted towards the threshold)"
+    end
   end
   puts "Total : #{summary[:total]} finding(s)"
   puts "Highest Severity : #{summary[:highest] != nil ? summary[:highest] : "none"}"
@@ -849,6 +849,35 @@ def write_environment_variables(values)
   end
 end
 
+# Both modes finish the same way: print the summary, publish the reports,
+# export the outputs and apply the severity gate. Never returns.
+def publish_and_finish(mode, summary, filenames, formats)
+  advance = mode == "advance"
+  tool = advance ? "MobSF" : "mobsfscan"
+  print_summary(advance ? "MobSF Advance Scan Summary" : "mobsfscan Summary",
+                summary, $severity_threshold)
+
+  export_path = $save_report ? copy_reports($report_path, filenames) : nil
+  report_dir = export_path != nil ? export_path : $report_path
+
+  outputs = get_step_outputs(summary, report_dir, formats)
+  if advance
+    outputs["AC_MOBSFSCAN_SCAN_MODE_USED"] = "advance"
+    outputs["AC_MOBSFSCAN_MOBSF_REPORT_PATH"] = "#{report_dir}/#{MOBSF_REPORT_FILENAME}"
+    outputs["AC_MOBSFSCAN_SECURITY_SCORE"] =
+      summary[:security_score] != nil ? summary[:security_score] : ""
+  end
+  write_environment_variables(outputs)
+
+  if is_threshold_exceeded(summary, $severity_threshold)
+    abort_script("#{tool} found findings at or above the `#{$severity_threshold}` severity " \
+                 "threshold. The reports are still published as artifacts.")
+  end
+
+  puts "#{tool} completed without exceeding the severity threshold."
+  exit 0
+end
+
 def get_step_outputs(summary, report_dir, formats)
   outputs = {
     "AC_MOBSFSCAN_REPORT_DIR" => report_dir,
@@ -885,62 +914,13 @@ FileUtils.mkdir_p($step_temp)
 FileUtils.mkdir_p($report_path)
 
 ### Advance mode uses the MobSF installation provisioned on the runner and
-### scans a zip of the source. It falls back to the light scan whenever the
-### runner cannot serve it, so the step never fails just for being on a runner
-### without MobSF.
-$scan_mode_used = "light"
-
+### scans a zip of the source, falling back to the light scan whenever the
+### runner cannot serve it.
 if $scan_mode == "advance"
-  puts "Advance scan requested, looking for a MobSF installation on this runner"
-  $mobsf_prefix = get_mobsf_prefix()
-
-  if $mobsf_prefix == nil
-    puts "@@[warning] No MobSF installation found (looked for #{MOBSF_MANIFEST_FILE} under " \
-         "#{DEFAULT_MOBSF_PREFIXES.join(", ")}). Falling back to the light scan."
-  else
-    $mobsf_manifest = read_mobsf_manifest($mobsf_prefix)
-    if $mobsf_manifest != nil
-      puts "Found MobSF #{$mobsf_manifest["mobsfVersion"]} at #{$mobsf_prefix}"
-    end
-
-    $mobsf_control = get_mobsf_control($mobsf_prefix)
-    if $mobsf_control == nil
-      puts "@@[warning] MobSF is installed at #{$mobsf_prefix} but #{MOBSF_CONTROL_SCRIPT} was not " \
-           "found in the #{get_mobsf_control_candidates($mobsf_prefix).length} locations searched " \
-           "under #{[$mobsf_prefix, $step_temp].compact.join(", ")} and PATH. It ships with the " \
-           "runner package, so this runner may predate it."
-      puts "@@[warning] Falling back to the light scan."
-    else
-      $advance_report_path = "#{$report_path}/#{MOBSF_REPORT_FILENAME}"
-      $advance_summary = run_advance_scan($mobsf_prefix, $mobsf_control, $advance_report_path)
-      $scan_mode_used = "advance" if $advance_summary != nil
-      puts "@@[warning] Falling back to the light scan." if $advance_summary == nil
-    end
-  end
+  $advance_summary = try_advance_scan()
+  publish_and_finish("advance", $advance_summary, [MOBSF_REPORT_FILENAME], []) if $advance_summary != nil
+  puts "@@[warning] Falling back to the light scan."
 end
-
-if $scan_mode_used == "advance"
-
-print_advance_summary($advance_summary, $severity_threshold)
-
-$export_path = copy_reports($report_path, [MOBSF_REPORT_FILENAME]) if $save_report
-
-$outputs = get_step_outputs($advance_summary, $export_path != nil ? $export_path : $report_path, [])
-$outputs["AC_MOBSFSCAN_SCAN_MODE_USED"] = "advance"
-$outputs["AC_MOBSFSCAN_MOBSF_REPORT_PATH"] = "#{$export_path != nil ? $export_path : $report_path}/#{MOBSF_REPORT_FILENAME}"
-$outputs["AC_MOBSFSCAN_SECURITY_SCORE"] = $advance_summary[:security_score] != nil ? $advance_summary[:security_score] : ""
-write_environment_variables($outputs)
-
-if is_threshold_exceeded($advance_summary, $severity_threshold)
-  abort_script("MobSF found findings at or above the `#{$severity_threshold}` severity " \
-               "threshold. The report is still published as an artifact.")
-end
-
-puts "MobSF advance scan completed without exceeding the severity threshold."
-
-exit 0
-
-end # if $scan_mode_used == "advance"
 
 puts "Scanning #{$source_path} (type: #{$scan_type}, formats: #{$output_formats.join(", ")})"
 if $config_path != nil
@@ -961,24 +941,8 @@ scan_formats.each { |format| run_scan(format) }
 $report = parse_report("#{$report_path}/#{OUTPUT_FORMATS["json"][:filename]}")
 check_scan_errors($report)
 
-$summary = summarize_report($report)
-print_summary($summary, $severity_threshold)
-
-$export_path = nil
-if $save_report
-  filenames = $output_formats.map { |format| OUTPUT_FORMATS[format][:filename] }
-  $export_path = copy_reports($report_path, filenames)
-end
-
-write_environment_variables(get_step_outputs($summary, $export_path != nil ? $export_path : $report_path, $output_formats))
-
-if is_threshold_exceeded($summary, $severity_threshold)
-  abort_script("mobsfscan found findings at or above the `#{$severity_threshold}` severity " \
-               "threshold. The reports are still published as artifacts.")
-end
-
-puts "mobsfscan completed without exceeding the severity threshold."
-
-exit 0
+publish_and_finish("light", summarize_report($report),
+                   $output_formats.map { |format| OUTPUT_FORMATS[format][:filename] },
+                   $output_formats)
 
 end # if __FILE__ == $PROGRAM_NAME
