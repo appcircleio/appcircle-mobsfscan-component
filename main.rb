@@ -410,12 +410,10 @@ def get_scan_mode()
   return mode
 end
 
-# The installation prefix comes from the input, then MOBSF_HOME, then the
-# well known provisioning paths. Returns nil when none of them hold a manifest.
+# The installation prefix comes from MOBSF_HOME, then the well known
+# provisioning paths. Returns nil when none of them hold a manifest.
 def get_mobsf_prefix()
   candidates = []
-  configured = env_default("AC_MOBSFSCAN_MOBSF_PREFIX", nil)
-  candidates.push(configured) if configured != nil
   mobsf_home = env_default("MOBSF_HOME", nil)
   candidates.push(mobsf_home) if mobsf_home != nil
   candidates.concat(DEFAULT_MOBSF_PREFIXES)
@@ -437,17 +435,7 @@ def read_mobsf_manifest(prefix)
   end
 end
 
-# mobsf-control.sh ships in the runner package, not under the install prefix,
-# so the runner scripts directory is searched as well.
 def get_mobsf_control(prefix)
-  configured = env_default("AC_MOBSFSCAN_MOBSF_CONTROL", nil)
-  if configured != nil
-    unless File.file?(configured)
-      abort_script("The MobSF control script was not found at #{configured}.")
-    end
-    return configured
-  end
-
   get_mobsf_control_candidates(prefix).each do |candidate|
     return candidate if File.file?(candidate)
   end
@@ -533,6 +521,9 @@ end
 # depending on a `zip` binary being present on every runner image.
 def create_source_zip(source_path, zip_path)
   puts "Archiving #{source_path} for MobSF"
+  # Written to a file rather than passed with -c: an inline script turns the
+  # logged command into a dozen lines of escaped Python.
+  script_path = "#{File.dirname(zip_path)}/mobsf_archive.py"
   script = <<~PYTHON
     import os, sys, zipfile
     source, target, excluded = sys.argv[1], sys.argv[2], set(sys.argv[3].split(","))
@@ -549,8 +540,15 @@ def create_source_zip(source_path, zip_path)
     print(count)
   PYTHON
 
+  begin
+    FileUtils.mkdir_p(File.dirname(script_path))
+    File.write(script_path, script)
+  rescue Exception => e
+    abort_script(e)
+  end
+
   stdout_str, stderr_str, exit_code = run_command(
-    ["python3", "-c", script, source_path, zip_path, ZIP_EXCLUDE_DIRS.join(",")], true, VENV_TIMEOUT)
+    ["python3", script_path, source_path, zip_path, ZIP_EXCLUDE_DIRS.join(",")], true, VENV_TIMEOUT)
 
   unless exit_code == 0
     abort_script("The source code could not be archived for MobSF.\n#{stderr_str}")
@@ -908,10 +906,9 @@ if $scan_mode == "advance"
     $mobsf_control = get_mobsf_control($mobsf_prefix)
     if $mobsf_control == nil
       puts "@@[warning] MobSF is installed at #{$mobsf_prefix} but #{MOBSF_CONTROL_SCRIPT} was not " \
-           "found. It ships with the runner package, not with the MobSF installation. Set the " \
-           "`AC_MOBSFSCAN_MOBSF_CONTROL` input to its full path to use the advance scan. " \
-           "Searched #{get_mobsf_control_candidates($mobsf_prefix).length} locations under " \
-           "#{[$mobsf_prefix, $step_temp].compact.join(", ")} and PATH."
+           "found in the #{get_mobsf_control_candidates($mobsf_prefix).length} locations searched " \
+           "under #{[$mobsf_prefix, $step_temp].compact.join(", ")} and PATH. It ships with the " \
+           "runner package, so this runner may predate it."
       puts "@@[warning] Falling back to the light scan."
     else
       $advance_report_path = "#{$report_path}/#{MOBSF_REPORT_FILENAME}"

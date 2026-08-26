@@ -136,7 +136,7 @@ INPUT_KEYS = %w[
   AC_MOBSFSCAN_CONFIG_PATH AC_MOBSFSCAN_SAVE_REPORT AC_MOBSFSCAN_TIMEOUT
   AC_MOBSFSCAN_EXTRA_PARAMETERS AC_MOBSFSCAN_PIP_INDEX_URL
   AC_MOBSFSCAN_PIP_FIND_LINKS AC_MOBSFSCAN_SCAN_MODE AC_MOBSFSCAN_ADVANCE_TIMEOUT
-  AC_MOBSFSCAN_MOBSF_PREFIX AC_MOBSFSCAN_MOBSF_CONTROL MOBSF_HOME AC_RUNNER_DIR
+  MOBSF_HOME AC_RUNNER_DIR
 ].freeze
 
 def reset_inputs
@@ -205,13 +205,19 @@ end
 # Report content assertions must not depend on the severity gate, so the helper
 # scans in report only mode. The threshold examples set their own value, and
 # passing nil for a key exercises the step's own default.
-def run_main(source, env = {})
+def run_main(source, env = {}, fake_mobsf = nil)
   Dir.mktmpdir do |workspace|
     step_temp = File.join(workspace, 'step_temp')
     output_dir = File.join(workspace, 'output')
     env_file = File.join(workspace, 'env_file')
     FileUtils.mkdir_p([step_temp, output_dir])
     FileUtils.touch(env_file)
+
+    mobsf_env = {}
+    if fake_mobsf
+      mobsf_env['MOBSF_HOME'] =
+        plant_fake_mobsf(workspace, fake_mobsf[:report], fake_mobsf.fetch(:exit_code, 0))
+    end
 
     clean_env = INPUT_KEYS.each_with_object({}) { |key, acc| acc[key] = nil }
                           .merge(
@@ -224,6 +230,7 @@ def run_main(source, env = {})
                             'AC_MOBSFSCAN_SEVERITY_THRESHOLD' => 'none',
                             'AC_MOBSFSCAN_OUTPUT_FORMATS' => 'sarif,json'
                           )
+                          .merge(mobsf_env)
                           .merge(wheelhouse_input(env))
                           .merge(env)
                           .reject { |_, value| value.nil? }
@@ -235,12 +242,15 @@ def run_main(source, env = {})
       outputs[key] = value
     end
 
+    args_file = File.join(workspace, 'last-args')
     yield({
       stdout: stdout_str,
       stderr: stderr_str,
       success: status.success?,
       outputs: outputs,
-      output_dir: File.join(output_dir, 'mobsfscan_output')
+      output_dir: File.join(output_dir, 'mobsfscan_output'),
+      mobsf_args: File.file?(args_file) ? File.read(args_file).strip : nil,
+      mobsf_zip: File.join(workspace, 'received.zip')
     })
   end
 end
@@ -1034,15 +1044,7 @@ RSpec.describe '#get_mobsf_prefix' do
   end
 
   context 'positive path' do
-    it 'uses the configured prefix when it holds a manifest' do
-      Dir.mktmpdir do |prefix|
-        with_manifest(prefix)
-        ENV['AC_MOBSFSCAN_MOBSF_PREFIX'] = prefix
-        expect(get_mobsf_prefix).to eq(prefix)
-      end
-    end
-
-    it 'falls back to MOBSF_HOME' do
+    it 'uses MOBSF_HOME when it holds a manifest' do
       Dir.mktmpdir do |prefix|
         with_manifest(prefix)
         ENV['MOBSF_HOME'] = prefix
@@ -1052,9 +1054,9 @@ RSpec.describe '#get_mobsf_prefix' do
   end
 
   context 'negative path – nothing provisioned' do
-    it 'returns nil when the configured prefix has no manifest' do
+    it 'returns nil when MOBSF_HOME holds no manifest' do
       Dir.mktmpdir do |prefix|
-        ENV['AC_MOBSFSCAN_MOBSF_PREFIX'] = prefix
+        ENV['MOBSF_HOME'] = prefix
         expect(get_mobsf_prefix).to be_nil
       end
     end
@@ -1107,15 +1109,6 @@ RSpec.describe '#get_mobsf_control' do
       end
     end
 
-    it 'prefers the explicitly configured path' do
-      Dir.mktmpdir do |root|
-        prefix = File.join(root, 'mobsf')
-        install_control(File.join(prefix, 'scripts'))
-        explicit = install_control(File.join(root, 'custom'))
-        ENV['AC_MOBSFSCAN_MOBSF_CONTROL'] = explicit
-        expect(get_mobsf_control(prefix)).to eq(explicit)
-      end
-    end
   end
 
   context 'negative path' do
@@ -1126,11 +1119,6 @@ RSpec.describe '#get_mobsf_control' do
         $step_temp = prefix
         expect(get_mobsf_control(prefix)).to be_nil
       end
-    end
-
-    it 'aborts when the configured path does not exist' do
-      ENV['AC_MOBSFSCAN_MOBSF_CONTROL'] = '/nope/mobsf-control.sh'
-      expect(capture_abort { get_mobsf_control('/prefix') }).to include('was not found')
     end
   end
 end
@@ -1330,46 +1318,51 @@ end
 
 # ─── Fake MobSF Runner Helper ─────────────────────────────────────────────────
 # There is no provisioned MobSF on a dev machine, so the advance path is driven
-# against a stand-in mobsf-control.sh that honours the documented contract:
-# it validates the arguments, writes the report to --output and returns one of
-# the documented exit codes.
-def with_fake_mobsf(report: nil, exit_code: 0)
-  Dir.mktmpdir do |prefix|
-    File.write(File.join(prefix, 'appcircle-mobsf-manifest.json'),
-               JSON.dump({ 'schemaVersion' => 1, 'mobsfVersion' => '4.5.2',
-                           'listenPort' => 8000, 'prefix' => prefix }))
-    control = File.join(prefix, 'mobsf-control.sh')
-    payload = File.join(prefix, 'canned-report.json')
-    File.write(payload, JSON.dump(report)) if report
+# against a stand-in mobsf-control.sh that honours the documented contract: it
+# validates the arguments, writes the report to --output and returns one of the
+# documented exit codes.
+#
+# It is planted the way a real runner is laid out, with MobSF under its own
+# prefix and the control script in a scripts/ directory further up, so the
+# step's own discovery has to find both. The step exposes no path inputs.
+def plant_fake_mobsf(workspace, report, exit_code)
+  prefix = File.join(workspace, 'mobsf')
+  FileUtils.mkdir_p(prefix)
+  File.write(File.join(prefix, 'appcircle-mobsf-manifest.json'),
+             JSON.dump({ 'schemaVersion' => 1, 'mobsfVersion' => '4.5.2',
+                         'listenPort' => 8000, 'prefix' => prefix }))
 
-    File.write(control, <<~SH)
-      #!/bin/sh
-      # Records the invocation, then behaves like mobsf-control.sh --action scan.
-      echo "$@" > "#{prefix}/last-args"
-      output=""
-      file=""
-      while [ $# -gt 0 ]; do
-        case "$1" in
-          --output) output="$2"; shift 2 ;;
-          --file) file="$2"; shift 2 ;;
-          *) shift ;;
-        esac
-      done
-      cp "$file" "#{prefix}/received.zip" 2>/dev/null
-      if [ #{exit_code} -ne 0 ]; then
-        echo "fake mobsf failure" >&2
-        exit #{exit_code}
-      fi
-      cp "#{payload}" "$output"
-      echo "[MobSF] AppSec summary written"
-      exit 0
-    SH
-    FileUtils.chmod(0o755, control)
+  scripts = File.join(workspace, 'scripts')
+  FileUtils.mkdir_p(scripts)
+  control = File.join(scripts, 'mobsf-control.sh')
+  payload = File.join(workspace, 'canned-report.json')
+  File.write(payload, JSON.dump(report)) if report
 
-    yield({ prefix: prefix, control: control,
-            args: -> { File.read(File.join(prefix, 'last-args')).strip },
-            received_zip: File.join(prefix, 'received.zip') })
-  end
+  File.write(control, <<~SH)
+    #!/bin/sh
+    # Records the invocation, then behaves like mobsf-control.sh --action scan.
+    echo "$@" > "#{workspace}/last-args"
+    output=""
+    file=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --output) output="$2"; shift 2 ;;
+        --file) file="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    cp "$file" "#{workspace}/received.zip" 2>/dev/null
+    if [ #{exit_code} -ne 0 ]; then
+      echo "fake mobsf failure" >&2
+      exit #{exit_code}
+    fi
+    cp "#{payload}" "$output"
+    echo "[MobSF] AppSec summary written"
+    exit 0
+  SH
+  FileUtils.chmod(0o755, control)
+
+  return prefix
 end
 
 def mobsf_report(high: 0, warning: 0, info: 0, secure: 0, hotspot: 0, score: 67)
@@ -1597,59 +1590,49 @@ RSpec.describe 'main.rb advance mode end to end' do
 
   context 'positive path – MobSF provisioned on the runner' do
     it 'zips the source, drives mobsf-control.sh and reports the advance result' do
-      with_fake_mobsf(report: mobsf_report(warning: 2, info: 1, secure: 3)) do |mobsf|
-        run_main('studio',
-                 'AC_MOBSFSCAN_SCAN_MODE' => 'advance',
-                 'AC_MOBSFSCAN_MOBSF_PREFIX' => mobsf[:prefix],
-                 'AC_MOBSFSCAN_MOBSF_CONTROL' => mobsf[:control]) do |result|
-          expect(result[:success]).to be(true), "step failed:\n#{result[:stdout]}\n#{result[:stderr]}"
-          expect(result[:outputs]['AC_MOBSFSCAN_SCAN_MODE_USED']).to eq('advance')
-          expect(result[:outputs]['AC_MOBSFSCAN_SECURITY_SCORE']).to eq('67')
-          expect(result[:outputs]['AC_MOBSFSCAN_WARNING_COUNT']).to eq('2')
-          expect(result[:outputs]['AC_MOBSFSCAN_HIGHEST_SEVERITY']).to eq('WARNING')
-          expect(File.file?(File.join(result[:output_dir], 'mobsf-report.json'))).to be true
+      run_main('studio', { 'AC_MOBSFSCAN_SCAN_MODE' => 'advance' },
+               { report: mobsf_report(warning: 2, info: 1, secure: 3) }) do |result|
+        expect(result[:success]).to be(true), "step failed:\n#{result[:stdout]}\n#{result[:stderr]}"
+        expect(result[:outputs]['AC_MOBSFSCAN_SCAN_MODE_USED']).to eq('advance')
+        expect(result[:outputs]['AC_MOBSFSCAN_SECURITY_SCORE']).to eq('67')
+        expect(result[:outputs]['AC_MOBSFSCAN_WARNING_COUNT']).to eq('2')
+        expect(result[:outputs]['AC_MOBSFSCAN_HIGHEST_SEVERITY']).to eq('WARNING')
+        expect(File.file?(File.join(result[:output_dir], 'mobsf-report.json'))).to be true
 
-          # It must never install mobsfscan when the advance scan served the build.
-          expect(result[:stdout]).not_to include('Installing mobsfscan')
-        end
+        # It must never install mobsfscan when the advance scan served the build.
+        expect(result[:stdout]).not_to include('Installing mobsfscan')
       end
     end
 
-    it 'passes the documented mobsf-control.sh arguments and a real zip' do
-      with_fake_mobsf(report: mobsf_report) do |mobsf|
-        run_main('studio',
-                 'AC_MOBSFSCAN_SCAN_MODE' => 'advance',
-                 'AC_MOBSFSCAN_MOBSF_PREFIX' => mobsf[:prefix],
-                 'AC_MOBSFSCAN_MOBSF_CONTROL' => mobsf[:control],
-                 'AC_MOBSFSCAN_ADVANCE_TIMEOUT' => '1234') do |result|
-          expect(result[:success]).to be true
+    # The step takes no path inputs, so this also covers discovery: the manifest
+    # comes from MOBSF_HOME and the control script from a scripts/ directory
+    # above the step's working directory, exactly as on a real runner.
+    it 'discovers the control script and passes the documented arguments with a real zip' do
+      run_main('studio',
+               { 'AC_MOBSFSCAN_SCAN_MODE' => 'advance', 'AC_MOBSFSCAN_ADVANCE_TIMEOUT' => '1234' },
+               { report: mobsf_report }) do |result|
+        expect(result[:success]).to be(true), "step failed:\n#{result[:stdout]}\n#{result[:stderr]}"
 
-          args = mobsf[:args].call
-          expect(args).to include('--action scan')
-          expect(args).to include("--prefix #{mobsf[:prefix]}")
-          expect(args).to include('--scan-timeout 1234')
+        expect(result[:mobsf_args]).to include('--action scan')
+        expect(result[:mobsf_args]).to include('--scan-timeout 1234')
+        expect(result[:mobsf_args]).to match(%r{--prefix \S+/mobsf})
 
-          listing, = Open3.capture2('python3', '-c',
-                                    'import sys,zipfile;print("\\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))',
-                                    mobsf[:received_zip])
-          expect(listing).to include('app/src/main/AndroidManifest.xml')
-          expect(listing).to include('app/src/main/java/com/example/studio/MainActivity.java')
-        end
+        listing, = Open3.capture2('python3', '-c',
+                                  'import sys,zipfile;print("\\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))',
+                                  result[:mobsf_zip])
+        expect(listing).to include('app/src/main/AndroidManifest.xml')
+        expect(listing).to include('app/src/main/java/com/example/studio/MainActivity.java')
       end
     end
 
     it 'fails the build when MobSF findings breach the threshold' do
-      with_fake_mobsf(report: mobsf_report(high: 1, score: 30)) do |mobsf|
-        run_main('studio',
-                 'AC_MOBSFSCAN_SCAN_MODE' => 'advance',
-                 'AC_MOBSFSCAN_SEVERITY_THRESHOLD' => 'error',
-                 'AC_MOBSFSCAN_MOBSF_PREFIX' => mobsf[:prefix],
-                 'AC_MOBSFSCAN_MOBSF_CONTROL' => mobsf[:control]) do |result|
-          expect(result[:success]).to be false
-          expect(result[:stdout] + result[:stderr]).to include('severity threshold')
-          # The report is still published on the failing path.
-          expect(File.file?(File.join(result[:output_dir], 'mobsf-report.json'))).to be true
-        end
+      run_main('studio',
+               { 'AC_MOBSFSCAN_SCAN_MODE' => 'advance', 'AC_MOBSFSCAN_SEVERITY_THRESHOLD' => 'error' },
+               { report: mobsf_report(high: 1, score: 30) }) do |result|
+        expect(result[:success]).to be false
+        expect(result[:stdout] + result[:stderr]).to include('severity threshold')
+        # The report is still published on the failing path.
+        expect(File.file?(File.join(result[:output_dir], 'mobsf-report.json'))).to be true
       end
     end
   end
@@ -1658,9 +1641,7 @@ RSpec.describe 'main.rb advance mode end to end' do
   # MobSF must still produce a scan, not a failed build.
   context 'positive path – falls back to the light scan' do
     it 'falls back when no MobSF installation is present' do
-      run_main('android',
-               'AC_MOBSFSCAN_SCAN_MODE' => 'advance',
-               'AC_MOBSFSCAN_MOBSF_PREFIX' => '/nonexistent/mobsf') do |result|
+      run_main('android', 'AC_MOBSFSCAN_SCAN_MODE' => 'advance') do |result|
         expect(result[:success]).to be(true), "step failed:\n#{result[:stdout]}\n#{result[:stderr]}"
         expect(result[:stdout]).to include('No MobSF installation found')
         expect(result[:outputs]['AC_MOBSFSCAN_SCAN_MODE_USED']).to be_nil
@@ -1669,57 +1650,41 @@ RSpec.describe 'main.rb advance mode end to end' do
     end
 
     it 'falls back when the source layout is one MobSF cannot read' do
-      with_fake_mobsf(report: mobsf_report) do |mobsf|
-        run_main('android',
-                 'AC_MOBSFSCAN_SCAN_MODE' => 'advance',
-                 'AC_MOBSFSCAN_MOBSF_PREFIX' => mobsf[:prefix],
-                 'AC_MOBSFSCAN_MOBSF_CONTROL' => mobsf[:control]) do |result|
-          expect(result[:success]).to be true
-          expect(result[:stdout]).to include('does not look like an Android or iOS project')
-          expect(File.file?(File.join(result[:output_dir], 'mobsfscan.json'))).to be true
-        end
+      run_main('android', { 'AC_MOBSFSCAN_SCAN_MODE' => 'advance' },
+               { report: mobsf_report }) do |result|
+        expect(result[:success]).to be true
+        expect(result[:stdout]).to include('does not look like an Android or iOS project')
+        expect(File.file?(File.join(result[:output_dir], 'mobsfscan.json'))).to be true
       end
     end
 
     it 'falls back when the installation is incomplete (exit code 3)' do
-      with_fake_mobsf(exit_code: 3) do |mobsf|
-        run_main('studio',
-                 'AC_MOBSFSCAN_SCAN_MODE' => 'advance',
-                 'AC_MOBSFSCAN_MOBSF_PREFIX' => mobsf[:prefix],
-                 'AC_MOBSFSCAN_MOBSF_CONTROL' => mobsf[:control]) do |result|
-          expect(result[:success]).to be true
-          expect(result[:stdout]).to include('setup-mobsf.sh')
-          expect(result[:stdout]).to include('Falling back to the light scan')
-        end
+      run_main('studio', { 'AC_MOBSFSCAN_SCAN_MODE' => 'advance' },
+               { exit_code: 3 }) do |result|
+        expect(result[:success]).to be true
+        expect(result[:stdout]).to include('setup-mobsf.sh')
+        expect(result[:stdout]).to include('Falling back to the light scan')
       end
     end
 
-    # An iOS source archive makes MobSF answer with a redirect marker rather
-    # than a report, so there is nothing to gate on.
+    # A report with no appsec section, such as the redirect marker MobSF can
+    # answer with, leaves nothing to gate on.
     it 'falls back when the report carries no appsec section' do
-      with_fake_mobsf(report: { 'type' => 'ios' }) do |mobsf|
-        run_main('studio',
-                 'AC_MOBSFSCAN_SCAN_MODE' => 'advance',
-                 'AC_MOBSFSCAN_MOBSF_PREFIX' => mobsf[:prefix],
-                 'AC_MOBSFSCAN_MOBSF_CONTROL' => mobsf[:control]) do |result|
-          expect(result[:success]).to be true
-          expect(result[:stdout]).to include('no `appsec` section')
-          expect(result[:stdout]).to include('type: ios')
-        end
+      run_main('studio', { 'AC_MOBSFSCAN_SCAN_MODE' => 'advance' },
+               { report: { 'type' => 'ios' } }) do |result|
+        expect(result[:success]).to be true
+        expect(result[:stdout]).to include('no `appsec` section')
+        expect(result[:stdout]).to include('type: ios')
       end
     end
   end
 
   context 'negative path – runtime failure' do
     it 'fails the build when the MobSF scan itself breaks' do
-      with_fake_mobsf(exit_code: 1) do |mobsf|
-        run_main('studio',
-                 'AC_MOBSFSCAN_SCAN_MODE' => 'advance',
-                 'AC_MOBSFSCAN_MOBSF_PREFIX' => mobsf[:prefix],
-                 'AC_MOBSFSCAN_MOBSF_CONTROL' => mobsf[:control]) do |result|
-          expect(result[:success]).to be false
-          expect(result[:stdout] + result[:stderr]).to include('The MobSF scan failed')
-        end
+      run_main('studio', { 'AC_MOBSFSCAN_SCAN_MODE' => 'advance' },
+               { exit_code: 1 }) do |result|
+        expect(result[:success]).to be false
+        expect(result[:stdout] + result[:stderr]).to include('The MobSF scan failed')
       end
     end
   end
