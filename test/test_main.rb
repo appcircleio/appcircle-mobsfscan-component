@@ -134,8 +134,8 @@ INPUT_KEYS = %w[
   AC_MOBSFSCAN_SOURCE_PATH AC_MOBSFSCAN_SCAN_TYPE AC_MOBSFSCAN_VERSION
   AC_MOBSFSCAN_OUTPUT_FORMATS AC_MOBSFSCAN_SEVERITY_THRESHOLD
   AC_MOBSFSCAN_CONFIG_PATH AC_MOBSFSCAN_SAVE_REPORT AC_MOBSFSCAN_TIMEOUT
-  AC_MOBSFSCAN_EXTRA_PARAMETERS AC_MOBSFSCAN_PIP_INDEX_URL
-  AC_MOBSFSCAN_PIP_FIND_LINKS AC_MOBSFSCAN_SCAN_MODE AC_MOBSFSCAN_ADVANCE_TIMEOUT
+  AC_MOBSFSCAN_EXTRA_PARAMETERS AC_MOBSFSCAN_SCAN_MODE AC_MOBSFSCAN_ADVANCE_TIMEOUT
+  PIP_INDEX_URL PIP_NO_INDEX PIP_FIND_LINKS
   MOBSF_HOME AC_RUNNER_DIR
 ].freeze
 
@@ -150,8 +150,8 @@ def reset_inputs
   $scan_type = nil
   $config_path = nil
   $extra_parameters = []
-  $pip_index_url = nil
-  $pip_find_links = nil
+  ENV.delete('PIP_INDEX_URL')
+  ENV.delete('PIP_EXTRA_INDEX_URL')
   $scan_mode = nil
   $step_temp = nil
 end
@@ -262,10 +262,11 @@ end
 def wheelhouse_input(env)
   wheelhouse = ENV['MOBSFSCAN_WHEELHOUSE']
   return {} if wheelhouse.nil? || wheelhouse.empty?
-  return {} if %w[AC_MOBSFSCAN_VERSION AC_MOBSFSCAN_PIP_INDEX_URL
-                  AC_MOBSFSCAN_PIP_FIND_LINKS].any? { |key| env.key?(key) }
+  return {} if %w[AC_MOBSFSCAN_VERSION PIP_INDEX_URL
+                  PIP_FIND_LINKS].any? { |key| env.key?(key) }
 
-  return { 'AC_MOBSFSCAN_PIP_FIND_LINKS' => wheelhouse }
+  # pip's own variables, which is also how an air gapped runner is configured.
+  return { 'PIP_NO_INDEX' => '1', 'PIP_FIND_LINKS' => wheelhouse }
 end
 
 def read_json_report(result, filename)
@@ -403,12 +404,19 @@ RSpec.describe '#mask_secrets' do
     end
   end
 
-  context 'positive path – index URL configured' do
+  # An internal index is configured through pip's own environment variables, and
+  # such a URL usually carries credentials.
+  context 'positive path – PIP_INDEX_URL configured' do
     it 'replaces the credentialed URL with a placeholder' do
-      $pip_index_url = 'https://user:token@pypi.internal/simple'
-      masked = mask_secrets("pip install --index-url #{$pip_index_url} mobsfscan==1.0.0")
+      ENV['PIP_INDEX_URL'] = 'https://user:token@pypi.internal/simple'
+      masked = mask_secrets("Looking in indexes: #{ENV['PIP_INDEX_URL']}")
       expect(masked).not_to include('token')
       expect(masked).to include('***')
+    end
+
+    it 'also scrubs PIP_EXTRA_INDEX_URL' do
+      ENV['PIP_EXTRA_INDEX_URL'] = 'https://user:secret@extra.internal/simple'
+      expect(mask_secrets("index #{ENV['PIP_EXTRA_INDEX_URL']}")).not_to include('secret')
     end
   end
 end
@@ -546,8 +554,8 @@ RSpec.describe '#get_severity_threshold' do
   after { reset_inputs }
 
   context 'positive path' do
-    it 'defaults to error, matching the tool default' do
-      expect(get_severity_threshold).to eq('error')
+    it 'defaults to critical' do
+      expect(get_severity_threshold).to eq('critical')
     end
 
     it 'accepts none for report only mode' do
@@ -558,8 +566,10 @@ RSpec.describe '#get_severity_threshold' do
 
   context 'negative path – unsupported value' do
     it 'aborts and names the supported values' do
-      ENV['AC_MOBSFSCAN_SEVERITY_THRESHOLD'] = 'critical'
-      expect(capture_abort { get_severity_threshold }).to include('warning')
+      ENV['AC_MOBSFSCAN_SEVERITY_THRESHOLD'] = 'blocker'
+      message = capture_abort { get_severity_threshold }
+      expect(message).to include('blocker')
+      expect(message).to include('critical, normal, low, none')
     end
   end
 end
@@ -767,20 +777,14 @@ RSpec.describe '#get_pip_install_command' do
     end
   end
 
-  context 'positive path – air gapped install' do
-    it 'passes --no-index with the wheel directory' do
-      $pip_find_links = '/wheels'
+  # An internal index or an offline wheel directory is configured through pip's
+  # own environment variables, so the command itself never carries them.
+  context 'positive path – index configured through the environment' do
+    it 'keeps the command free of index flags' do
+      ENV['PIP_INDEX_URL'] = 'https://pypi.internal/simple'
       command = get_pip_install_command('/venv', '1.0.0')
-      expect(command).to include('--no-index')
-      expect(command[command.index('--find-links'), 2]).to eq(['--find-links', '/wheels'])
-    end
-  end
-
-  context 'positive path – internal index' do
-    it 'passes the index URL' do
-      $pip_index_url = 'https://pypi.internal/simple'
-      command = get_pip_install_command('/venv', '1.0.0')
-      expect(command[command.index('--index-url'), 2]).to eq(['--index-url', 'https://pypi.internal/simple'])
+      expect(command).not_to include('--index-url')
+      expect(command).not_to include('--find-links')
     end
   end
 end
@@ -811,7 +815,7 @@ RSpec.describe '#get_install_failure_message' do
     it 'names the offline options instead of surfacing a pip error' do
       message = get_install_failure_message('1.0.0', 'Could not fetch URL: Temporary failure in name resolution')
       expect(message).to include('no usable outbound network access')
-      expect(message).to include('find-links')
+      expect(message).to include('PIP_FIND_LINKS')
     end
   end
 
@@ -947,8 +951,8 @@ RSpec.describe '#is_threshold_exceeded' do
   let(:clean) { summarize_report(build_report({})) }
 
   context 'positive path – threshold not reached' do
-    it 'passes warnings when the threshold is error' do
-      expect(is_threshold_exceeded(warnings_only, 'error')).to be false
+    it 'passes normal findings when the gate is critical' do
+      expect(is_threshold_exceeded(warnings_only, 'critical')).to be false
     end
 
     it 'passes everything when the threshold is none' do
@@ -963,16 +967,16 @@ RSpec.describe '#is_threshold_exceeded' do
   end
 
   context 'negative path – threshold reached' do
-    it 'fails on an error finding at the error threshold' do
-      expect(is_threshold_exceeded(with_error, 'error')).to be true
+    it 'fails on a critical finding at the critical gate' do
+      expect(is_threshold_exceeded(with_error, 'critical')).to be true
     end
 
-    it 'fails on a warning finding at the warning threshold' do
-      expect(is_threshold_exceeded(warnings_only, 'warning')).to be true
+    it 'fails on a normal finding at the normal gate' do
+      expect(is_threshold_exceeded(warnings_only, 'normal')).to be true
     end
 
-    it 'fails on a best practice finding at the info threshold' do
-      expect(is_threshold_exceeded(warnings_only, 'info')).to be true
+    it 'fails on a low finding at the low gate' do
+      expect(is_threshold_exceeded(warnings_only, 'low')).to be true
     end
   end
 end
@@ -1295,7 +1299,7 @@ RSpec.describe '#summarize_mobsf_report' do
 
     it 'produces the same shape the shared gate reads' do
       expect(summary[:highest]).to eq('ERROR')
-      expect(is_threshold_exceeded(summary, 'error')).to be true
+      expect(is_threshold_exceeded(summary, 'critical')).to be true
       expect(is_threshold_exceeded(summary, 'none')).to be false
     end
   end
@@ -1310,7 +1314,7 @@ RSpec.describe '#summarize_mobsf_report' do
     # secure and hotspot are not failures, so they must not trip the gate.
     it 'does not fail the gate on secure or hotspot entries alone' do
       summary = summarize_mobsf_report(appsec_report('secure' => [{}], 'hotspot' => [{}]))
-      expect(is_threshold_exceeded(summary, 'info')).to be false
+      expect(is_threshold_exceeded(summary, 'low')).to be false
     end
   end
 end
@@ -1520,16 +1524,16 @@ RSpec.describe 'main.rb end to end' do
 
   context 'negative path – severity threshold' do
     # The insecure Android sample carries an ERROR finding.
-    it 'fails the build at the default error threshold' do
+    it 'fails the build at the default critical gate' do
       run_main('android', 'AC_MOBSFSCAN_SEVERITY_THRESHOLD' => nil) do |result|
         expect(result[:success]).to be false
-        expect(result[:stdout] + result[:stderr]).to include('at or above the `error` severity threshold')
+        expect(result[:stdout] + result[:stderr]).to include('at or above the `critical` severity threshold')
         expect(result[:outputs]['AC_MOBSFSCAN_HIGHEST_SEVERITY']).to eq('ERROR')
       end
     end
 
-    it 'fails at the warning threshold and still publishes the report' do
-      run_main('android', 'AC_MOBSFSCAN_SEVERITY_THRESHOLD' => 'warning') do |result|
+    it 'fails at the normal gate and still publishes the report' do
+      run_main('android', 'AC_MOBSFSCAN_SEVERITY_THRESHOLD' => 'normal') do |result|
         expect(result[:success]).to be false
         expect(result[:stdout] + result[:stderr]).to include('severity threshold')
         expect(File.file?(File.join(result[:output_dir], 'mobsfscan.json'))).to be true
@@ -1563,8 +1567,8 @@ RSpec.describe 'main.rb end to end' do
       end
     end
 
-    it 'reports an unreachable index with an actionable message' do
-      run_main('clean', 'AC_MOBSFSCAN_PIP_INDEX_URL' => 'https://pypi.invalid-host.example/simple') do |result|
+    it 'reports an unreachable PIP_INDEX_URL with an actionable message' do
+      run_main('clean', 'PIP_INDEX_URL' => 'https://pypi.invalid-host.example/simple') do |result|
         expect(result[:success]).to be false
         expect(result[:stdout] + result[:stderr])
           .to match(/no usable outbound network access|was not found on the configured package index/)
@@ -1627,7 +1631,7 @@ RSpec.describe 'main.rb advance mode end to end' do
 
     it 'fails the build when MobSF findings breach the threshold' do
       run_main('studio',
-               { 'AC_MOBSFSCAN_SCAN_MODE' => 'advance', 'AC_MOBSFSCAN_SEVERITY_THRESHOLD' => 'error' },
+               { 'AC_MOBSFSCAN_SCAN_MODE' => 'advance', 'AC_MOBSFSCAN_SEVERITY_THRESHOLD' => 'critical' },
                { report: mobsf_report(high: 1, score: 30) }) do |result|
         expect(result[:success]).to be false
         expect(result[:stdout] + result[:stderr]).to include('severity threshold')

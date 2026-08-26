@@ -30,9 +30,12 @@ from the runner.
 - `AC_MOBSFSCAN_OUTPUT_FORMATS`: Output Format. `sarif` (default), `json`, `html`, `sonarqube`
   or `gitlab-sast`. Each format costs its own scan run, so the form offers one; the variable
   also accepts a comma separated list.
-- `AC_MOBSFSCAN_SEVERITY_THRESHOLD`: Severity Threshold. `error` (default), `warning`, `info` or
-  `none`. The build fails when a finding at or above this severity is reported, and `none` makes
-  the step report only.
+- `AC_MOBSFSCAN_SEVERITY_THRESHOLD`: Fail Build On. `critical` (default), `normal`, `low` or
+  `none`. The pipeline breaks when the report holds a finding at the selected level **or worse**,
+  so `low` is the strictest setting and `critical` the loosest. `none` only reports. The levels
+  map onto what the engines report: `critical` is mobsfscan `ERROR` and MobSF `high`, `normal` is
+  `WARNING` / `warning`, `low` is `INFO` / `info`. MobSF `secure` and `hotspot` entries never
+  break the pipeline.
 - `AC_MOBSFSCAN_CONFIG_PATH`: Config File Path. Path of the `.mobsf` config for rule tuning.
   When empty, a `.mobsf` file at the scan root is picked up automatically.
 - `AC_MOBSFSCAN_SAVE_REPORT`: Save Report. Copies the reports into the artifacts folder when
@@ -42,9 +45,6 @@ from the runner.
   `1800`.
 - `AC_MOBSFSCAN_EXTRA_PARAMETERS`: Scanner Parameters. Extra mobsfscan parameters, split with
   shell word rules and passed as separate arguments, never through a shell.
-- `AC_MOBSFSCAN_PIP_INDEX_URL`: Pip Index URL. Alternative package index, masked in the logs.
-- `AC_MOBSFSCAN_PIP_FIND_LINKS`: Pip Find Links. Wheel directory for an air gapped install,
-  which makes pip run with `--no-index`.
 
 ## Output Variables
 
@@ -54,12 +54,21 @@ from the runner.
   format was requested.
 - `AC_MOBSFSCAN_MOBSF_REPORT_PATH` / `AC_MOBSFSCAN_SECURITY_SCORE`: MobSF report path and
   AppSec score, set only when the advance scan ran.
-- `AC_MOBSFSCAN_FINDING_COUNT`, `AC_MOBSFSCAN_ERROR_COUNT`, `AC_MOBSFSCAN_WARNING_COUNT`,
-  `AC_MOBSFSCAN_INFO_COUNT`, `AC_MOBSFSCAN_HIGHEST_SEVERITY`: Finding counts and the highest
-  reported severity, or `NONE`.
+- `AC_MOBSFSCAN_FINDING_COUNT`, `AC_MOBSFSCAN_ERROR_COUNT` (critical),
+  `AC_MOBSFSCAN_WARNING_COUNT` (normal), `AC_MOBSFSCAN_INFO_COUNT` (low),
+  `AC_MOBSFSCAN_HIGHEST_SEVERITY`: Finding counts and the highest reported severity, or `NONE`.
 
 Reports are copied to `$AC_OUTPUT_DIR/mobsfscan_output/`, so add Export Build Artifacts after
 this step. They are published on the failing path too.
+
+## Air gapped runners
+
+The step has no package index inputs. `pip` reads its own configuration, so set `PIP_INDEX_URL`
+for an internal index, or `PIP_NO_INDEX` with `PIP_FIND_LINKS` for a mirrored wheel directory,
+from an Environment Variable group or the runner's `pip.conf`. A credentialed index URL belongs
+there rather than in a step field, and the step scrubs whatever those variables hold from the
+build log. When the install fails for lack of network, the step says so and names these
+variables instead of surfacing a raw pip error.
 
 ## Running tests
 

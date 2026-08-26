@@ -10,7 +10,7 @@ require_relative 'mobsf'
 DEFAULT_MOBSFSCAN_VERSION = "1.0.0"
 DEFAULT_OUTPUT_FORMATS = "sarif"
 DEFAULT_SCAN_TYPE = "auto"
-DEFAULT_SEVERITY_THRESHOLD = "error"
+DEFAULT_SEVERITY_THRESHOLD = "critical"
 DEFAULT_SCAN_TIMEOUT = 900
 INSTALL_TIMEOUT = 1800
 VENV_TIMEOUT = 300
@@ -22,7 +22,10 @@ RECOMMENDED_PYTHON = [3, 10]
 
 SEVERITIES = ["ERROR", "WARNING", "INFO"]
 SEVERITY_RANK = {"INFO" => 1, "WARNING" => 2, "ERROR" => 3}
-SEVERITY_THRESHOLDS = ["none", "info", "warning", "error"]
+# The gate is expressed in the vocabulary the step form offers, mapped onto the
+# severities the two engines report. `none` never fails the build.
+SEVERITY_THRESHOLDS = ["critical", "normal", "low", "none"]
+THRESHOLD_SEVERITY = {"critical" => "ERROR", "normal" => "WARNING", "low" => "INFO"}
 SCAN_TYPES = ["auto", "android", "ios"]
 
 ###### Scan Mode
@@ -95,12 +98,6 @@ $mobsfscan_version = env_default("AC_MOBSFSCAN_VERSION", DEFAULT_MOBSFSCAN_VERSI
 #save_report - Options: true, false
 $save_report = env_default("AC_MOBSFSCAN_SAVE_REPORT", "true") != "false"
 
-#pip_index_url - Masked in the logs, it may carry credentials
-$pip_index_url = env_default("AC_MOBSFSCAN_PIP_INDEX_URL", nil)
-
-#pip_find_links - Directory or URL of the wheels for an air gapped install
-$pip_find_links = env_default("AC_MOBSFSCAN_PIP_FIND_LINKS", nil)
-
 end # if __FILE__ == $PROGRAM_NAME
 
 ###### Abort Function
@@ -109,12 +106,19 @@ def abort_script(error)
 end
 
 ###### Log Masking
-# The pip index URL may embed credentials, so it never reaches the build log.
+# An internal package index is configured through pip's own environment
+# variables, and such a URL often embeds credentials, so whatever it holds is
+# scrubbed from the command log and from pip's own output.
+MASKED_ENV_KEYS = ["PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL"]
+
 def mask_secrets(text)
   masked = "#{text}"
-  return masked if $pip_index_url == nil
+  MASKED_ENV_KEYS.each do |key|
+    secret = env_default(key, nil)
+    masked = masked.gsub(secret, "***") if secret != nil
+  end
 
-  return masked.gsub($pip_index_url, "***")
+  return masked
 end
 
 ###### Run Command Function
@@ -209,7 +213,7 @@ def get_scan_type()
   return get_enum_input("AC_MOBSFSCAN_SCAN_TYPE", DEFAULT_SCAN_TYPE, SCAN_TYPES, "scan type")
 end
 
-#severity_threshold - Options: none, info, warning, error
+#severity_threshold - Options: critical, normal, low, none
 def get_severity_threshold()
   return get_enum_input("AC_MOBSFSCAN_SEVERITY_THRESHOLD", DEFAULT_SEVERITY_THRESHOLD,
                         SEVERITY_THRESHOLDS, "severity threshold")
@@ -329,25 +333,15 @@ def get_pip_install_command(venv_path, version)
   command = ["#{venv_path}/bin/pip", "install", "--no-input", "--disable-pip-version-check",
              "mobsfscan==#{version}"]
 
-  if $pip_find_links != nil
-    command.push("--no-index")
-    command.push("--find-links")
-    command.push($pip_find_links)
-  end
-
-  if $pip_index_url != nil
-    command.push("--index-url")
-    command.push($pip_index_url)
-  end
-
   return command
 end
 
 def get_install_failure_message(version, output)
   if NETWORK_ERROR_PATTERNS.any? { |pattern| output.include?(pattern) }
     return "mobsfscan could not be installed because this runner has no usable outbound network " \
-           "access to the Python package index. Provide an internal index with the pip index URL " \
-           "input, or an offline wheel directory with the pip find-links input."
+           "access to the Python package index. Point pip at an internal index or an offline " \
+           "wheel directory with PIP_INDEX_URL, or PIP_NO_INDEX together with PIP_FIND_LINKS, " \
+           "from an Environment Variable group."
   elsif output.include?("Requires-Python") || output.include?("requires a different Python")
     return "mobsfscan #{version} is not compatible with the python3 version on this runner. " \
            "Pin an older mobsfscan version or use a newer Python."
@@ -516,10 +510,16 @@ def print_summary(title, summary, threshold)
   puts "------------------------------------------------------"
 end
 
+# Fails the build when the report holds a finding at or above the selected
+# level, so picking `low` is the strictest setting and `critical` the loosest.
+# A stricter selection can never let a worse finding through.
 def is_threshold_exceeded(summary, threshold)
   return false if threshold == "none"
 
-  minimum = SEVERITY_RANK[threshold.upcase]
+  severity = THRESHOLD_SEVERITY[threshold]
+  abort_script("Unknown severity threshold `#{threshold}`.") if severity == nil
+
+  minimum = SEVERITY_RANK[severity]
   return SEVERITIES.any? { |severity| SEVERITY_RANK[severity] >= minimum && summary[:totals][severity] > 0 }
 end
 
