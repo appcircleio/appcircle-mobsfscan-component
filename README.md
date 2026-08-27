@@ -1,4 +1,4 @@
-# Appcircle _MobSF Scan_ component
+# Appcircle _MobSF Source Code Scan_ component
 
 Runs MobSF static analysis on mobile source code: Java, Kotlin, Android XML, Swift and
 Objective-C. Findings carry file, line, rule id, severity and CWE / OWASP MASVS references.
@@ -49,8 +49,8 @@ from the runner.
 ## Output Variables
 
 - `AC_MOBSFSCAN_SCAN_MODE_USED`: Which scan ran, `light` or `advance`.
-- `AC_MOBSFSCAN_SARIF_REPORT_PATH` / `AC_MOBSFSCAN_JSON_REPORT_PATH`: Report paths, when that
-  format was requested.
+- `AC_MOBSFSCAN_JSON_REPORT_PATH`: Path of the JSON report, when `json` was requested. The other
+  formats are still produced, they are collected from the artifacts folder rather than a variable.
 - `AC_MOBSFSCAN_MOBSF_REPORT_PATH` / `AC_MOBSFSCAN_SECURITY_SCORE`: MobSF report path and the
   score out of 100, set only when the advance scan ran.
 - `AC_MOBSFSCAN_FINDING_COUNT`, `AC_MOBSFSCAN_CRITICAL_COUNT`, `AC_MOBSFSCAN_NORMAL_COUNT`,

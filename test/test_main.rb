@@ -993,10 +993,12 @@ RSpec.describe '#get_step_outputs' do
       expect(outputs['AC_MOBSFSCAN_WORST_LEVEL']).to eq('critical')
     end
 
-    it 'exports the report paths for the requested formats' do
+    # Only the JSON path is exported. The other formats are still produced,
+    # they are just collected from the artifact folder rather than a variable.
+    it 'exports the JSON report path when json was requested' do
       outputs = get_step_outputs(summary, '/reports', %w[sarif json])
-      expect(outputs['AC_MOBSFSCAN_SARIF_REPORT_PATH']).to eq('/reports/mobsfscan.sarif')
       expect(outputs['AC_MOBSFSCAN_JSON_REPORT_PATH']).to eq('/reports/mobsfscan.json')
+      expect(outputs.keys.grep(/SARIF/)).to be_empty
     end
 
     it 'omits the path of a format that was not requested' do
@@ -1438,8 +1440,7 @@ RSpec.describe 'main.rb end to end' do
 
         expect(result[:outputs]['AC_MOBSFSCAN_JSON_REPORT_PATH'])
           .to eq(File.join(result[:output_dir], 'mobsfscan.json'))
-        expect(result[:outputs]['AC_MOBSFSCAN_SARIF_REPORT_PATH'])
-          .to eq(File.join(result[:output_dir], 'mobsfscan.sarif'))
+        expect(result[:outputs].keys.grep(/SARIF/)).to be_empty
         expect(result[:outputs]['AC_MOBSFSCAN_FINDING_COUNT'].to_i).to be > 0
         expect(%w[critical normal low]).to include(result[:outputs]['AC_MOBSFSCAN_WORST_LEVEL'])
       end

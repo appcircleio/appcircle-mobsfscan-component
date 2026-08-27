@@ -614,10 +614,11 @@ def get_step_outputs(summary, report_dir, formats)
     "AC_MOBSFSCAN_WORST_LEVEL" => summary[:highest] != nil ? SEVERITY_LABEL[summary[:highest]].downcase : "none"
   }
 
-  formats.each do |format|
-    next unless ["json", "sarif"].include?(format)
-
-    outputs["AC_MOBSFSCAN_#{format.upcase}_REPORT_PATH"] = "#{report_dir}/#{OUTPUT_FORMATS[format][:filename]}"
+  # Only the JSON path is exported. MobSF itself reports as JSON or PDF, and the
+  # other formats are produced for external tools that are handed the artifact
+  # folder rather than a variable.
+  if formats.include?("json")
+    outputs["AC_MOBSFSCAN_JSON_REPORT_PATH"] = "#{report_dir}/#{OUTPUT_FORMATS["json"][:filename]}"
   end
 
   return outputs
