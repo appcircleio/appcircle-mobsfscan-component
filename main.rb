@@ -37,13 +37,17 @@ SCAN_TYPES = ["auto", "android", "ios"]
 SCAN_MODES = ["light", "advance"]
 DEFAULT_SCAN_MODE = "light"
 
-# mobsfscan takes a single -o, so every output format needs its own run.
+# Every report is published under the same base name so the artifact is
+# recognizable without opening it. mobsfscan takes a single -o, so each format
+# costs its own run, and the formats are exactly the ones its CLI offers:
+# --json, --sarif, --sonarqube, --gitlab-sast and --html.
+REPORT_BASENAME = "mobsf-source-code-analyze"
 OUTPUT_FORMATS = {
-  "json" => {:flag => "--json", :filename => "mobsfscan.json"},
-  "sarif" => {:flag => "--sarif", :filename => "mobsfscan.sarif"},
-  "html" => {:flag => "--html", :filename => "mobsfscan.html"},
-  "sonarqube" => {:flag => "--sonarqube", :filename => "mobsfscan-sonarqube.json"},
-  "gitlab-sast" => {:flag => "--gitlab-sast", :filename => "mobsfscan-gitlab-sast.json"}
+  "json" => {:flag => "--json", :filename => "#{REPORT_BASENAME}.json"},
+  "sarif" => {:flag => "--sarif", :filename => "#{REPORT_BASENAME}.sarif"},
+  "html" => {:flag => "--html", :filename => "#{REPORT_BASENAME}.html"},
+  "sonarqube" => {:flag => "--sonarqube", :filename => "#{REPORT_BASENAME}.sonarqube.json"},
+  "gitlab-sast" => {:flag => "--gitlab-sast", :filename => "#{REPORT_BASENAME}.gitlab-sast.json"}
 }
 
 NETWORK_ERROR_PATTERNS = [
@@ -233,6 +237,20 @@ def get_scan_timeout()
   return get_positive_number_input("AC_MOBSFSCAN_TIMEOUT", DEFAULT_SCAN_TIMEOUT, "timeout")
 end
 
+# Empty means no score gate. Only the advance scan produces a score, MobSF
+# grades out of 100, so a light scan has nothing to compare against.
+def get_minimum_score()
+  configured = env_default("AC_MOBSFSCAN_MIN_SCORE", nil)
+  return nil if configured == nil
+
+  score = configured.to_i
+  unless configured =~ /\A\d+\z/ && score <= 100
+    abort_script("Invalid minimum security score `#{configured}`. A number between 0 and 100 is expected.")
+  end
+
+  return score
+end
+
 #output_formats - Options: sarif, json, html, sonarqube, gitlab-sast
 def get_output_formats()
   configured = env_default("AC_MOBSFSCAN_OUTPUT_FORMATS", DEFAULT_OUTPUT_FORMATS).downcase
@@ -384,6 +402,35 @@ def verify_installed_version(venv_path, requested)
   puts "@@[warning] Requested mobsfscan #{requested} but #{installed} is installed."
 end
 
+###### Light Scan Logging
+# The light scan is the default, so its log is written to be read top to
+# bottom: what is about to be scanned, then one numbered line per stage, then
+# the summary. Without it the log opens on pip output and a user cannot tell
+# which mode ran or what it was pointed at.
+LIGHT_SCAN_STAGES = 3
+
+def print_stage(number, title)
+  puts ""
+  puts "[#{number}/#{LIGHT_SCAN_STAGES}] #{title}"
+end
+
+def print_light_scan_plan()
+  puts "------------------------------------------------------"
+  puts "MobSF Source Code Scan - light scan"
+  print_summary_line("Scanner", "mobsfscan #{$mobsfscan_version} CLI")
+  print_summary_line("Source path", $source_path)
+  print_summary_line("Rule set", $scan_type == "auto" ? "auto (detected from the source)" : $scan_type)
+  print_summary_line("Report format(s)", $output_formats.join(", "))
+  print_summary_line("Config", $config_path != nil ? $config_path :
+                     "`.mobsf` at the scan root, when present")
+  print_summary_line("Fail build on", $severity_threshold == "none" ? "none (report only)" :
+                     $severity_threshold)
+  if $minimum_score != nil
+    print_summary_line("Minimum score", "#{$minimum_score} (advance scan only, not checked here)")
+  end
+  puts "------------------------------------------------------"
+end
+
 ###### Scan
 def get_scan_command(format, output_file)
   command = ["#{$venv_path}/bin/mobsfscan", OUTPUT_FORMATS[format][:flag],
@@ -499,7 +546,7 @@ def print_summary_line(label, value)
   puts "  #{label.ljust(22)}#{value}"
 end
 
-def print_summary(title, summary, threshold)
+def print_summary(title, summary, threshold, minimum_score, failure)
   puts "------------------------------------------------------"
   puts title
   print_summary_line("Security score", "#{summary[:security_score]} / 100") if summary[:security_score] != nil
@@ -520,8 +567,16 @@ def print_summary(title, summary, threshold)
   print_summary_line("Total", "#{summary[:total]} finding(s)")
   print_summary_line("Worst level found", summary[:highest] != nil ? SEVERITY_LABEL[summary[:highest]] : "none")
   print_summary_line("Fail build on", threshold == "none" ? "none (report only)" : threshold)
-  print_summary_line("Verdict", is_threshold_exceeded(summary, threshold) ? "pipeline breaks" : "pipeline continues")
+  print_summary_line("Minimum score", get_minimum_score_label(summary, minimum_score))
+  print_summary_line("Verdict", failure != nil ? "pipeline breaks" : "pipeline continues")
   puts "------------------------------------------------------"
+end
+
+def get_minimum_score_label(summary, minimum_score)
+  return "not set" if minimum_score == nil
+  return "#{minimum_score} (the light scan reports no score, not checked)" if summary[:security_score] == nil
+
+  return "#{minimum_score}"
 end
 
 # Fails the build when the report holds a finding at or above the selected
@@ -537,28 +592,46 @@ def is_threshold_exceeded(summary, threshold)
   return SEVERITIES.any? { |severity| SEVERITY_RANK[severity] >= minimum && summary[:totals][severity] > 0 }
 end
 
+# The level gate and the score gate are independent, and both are evaluated on
+# every run: the first reads the findings, the second reads the MobSF score.
+# Either one on its own breaks the pipeline, so a `none` level still leaves the
+# score gate in force, and a score above the minimum does not excuse a finding.
+# Returns the reason, or nil when the pipeline continues.
+def get_gate_failure(summary, threshold, minimum_score, tool)
+  if minimum_score != nil && summary[:security_score] != nil &&
+     summary[:security_score] < minimum_score
+    return "the security score #{summary[:security_score]} is below the required #{minimum_score}"
+  end
+
+  return "#{tool} found a `#{threshold}` finding or worse" if is_threshold_exceeded(summary, threshold)
+
+  return nil
+end
+
 ###### Report Publishing & Environment Variables
+# The reports land directly in AC_OUTPUT_DIR under their own names, neither in
+# a subfolder nor archived, so Export Build Artifacts publishes each file as it
+# is.
 def copy_reports(report_path, filenames)
   if $output_path == nil
     puts "@@[warning] AC_OUTPUT_DIR is not set, the reports are not published as artifacts."
     return nil
   end
 
-  export_path = (Pathname.new $output_path).join("mobsfscan_output").to_s
   begin
-    FileUtils.mkdir_p(export_path)
+    FileUtils.mkdir_p($output_path)
     filenames.each do |filename|
       source = "#{report_path}/#{filename}"
       next unless File.file?(source)
 
-      puts "Copying #{filename} to #{export_path}"
-      FileUtils.cp(source, "#{export_path}/#{filename}")
+      puts "Publishing #{filename} to #{$output_path}"
+      FileUtils.cp(source, "#{$output_path}/#{filename}")
     end
   rescue Exception => e
     abort_script(e)
   end
 
-  return export_path
+  return $output_path
 end
 
 def write_environment_variables(values)
@@ -577,51 +650,43 @@ def write_environment_variables(values)
 end
 
 # Both modes finish the same way: print the summary, publish the reports,
-# export the outputs and apply the severity gate. Never returns.
-def publish_and_finish(mode, summary, filenames, formats)
+# export the outputs and apply the two gates. Never returns.
+def publish_and_finish(mode, summary, filenames)
   advance = mode == "advance"
   tool = advance ? "MobSF" : "mobsfscan"
-  print_summary(advance ? "MobSF Advance Scan Summary" : "mobsfscan Summary",
-                summary, $severity_threshold)
+  failure = get_gate_failure(summary, $severity_threshold, $minimum_score, tool)
+  print_summary("MobSF Source Code Scan Summary - #{advance ? "advance" : "light"} scan",
+                summary, $severity_threshold, $minimum_score, failure)
 
-  export_path = $save_report ? copy_reports($report_path, filenames) : nil
-  report_dir = export_path != nil ? export_path : $report_path
+  copy_reports($report_path, filenames) if $save_report
 
-  outputs = get_step_outputs(summary, report_dir, formats)
+  outputs = get_step_outputs(summary)
   if advance
     outputs["AC_MOBSFSCAN_SCAN_MODE_USED"] = "advance"
-    outputs["AC_MOBSFSCAN_MOBSF_REPORT_PATH"] = "#{report_dir}/#{MOBSF_REPORT_FILENAME}"
     outputs["AC_MOBSFSCAN_SECURITY_SCORE"] =
       summary[:security_score] != nil ? summary[:security_score] : ""
   end
   write_environment_variables(outputs)
 
-  if is_threshold_exceeded(summary, $severity_threshold)
-    abort_script("#{tool} found a `#{$severity_threshold}` finding or worse, which breaks the " \
-                 "pipeline. The reports are still published as artifacts.")
+  if failure != nil
+    abort_script("#{failure}, which breaks the pipeline. The reports are still published " \
+                 "as artifacts.")
   end
 
-  puts "#{tool} found nothing at or above `#{$severity_threshold}`, the pipeline continues."
+  puts "#{tool} found nothing that breaks the pipeline, the pipeline continues."
   exit 0
 end
 
-def get_step_outputs(summary, report_dir, formats)
-  outputs = {
+# No report path is exported: the reports are published into AC_OUTPUT_DIR
+# under a fixed name, so a following step already knows where to find them.
+def get_step_outputs(summary)
+  return {
     "AC_MOBSFSCAN_FINDING_COUNT" => summary[:total],
     "AC_MOBSFSCAN_CRITICAL_COUNT" => summary[:totals]["ERROR"],
     "AC_MOBSFSCAN_NORMAL_COUNT" => summary[:totals]["WARNING"],
     "AC_MOBSFSCAN_LOW_COUNT" => summary[:totals]["INFO"],
     "AC_MOBSFSCAN_WORST_LEVEL" => summary[:highest] != nil ? SEVERITY_LABEL[summary[:highest]].downcase : "none"
   }
-
-  # Only the JSON path is exported. MobSF itself reports as JSON or PDF, and the
-  # other formats are produced for external tools that are handed the artifact
-  # folder rather than a variable.
-  if formats.include?("json")
-    outputs["AC_MOBSFSCAN_JSON_REPORT_PATH"] = "#{report_dir}/#{OUTPUT_FORMATS["json"][:filename]}"
-  end
-
-  return outputs
 end
 
 ###############################################################
@@ -633,6 +698,7 @@ $scan_type = get_scan_type()
 $severity_threshold = get_severity_threshold()
 $output_formats = get_output_formats()
 $scan_timeout = get_scan_timeout()
+$minimum_score = get_minimum_score()
 $config_path = get_config_path($source_path)
 $extra_parameters = get_extra_parameters()
 $scan_mode = get_scan_mode()
@@ -645,31 +711,35 @@ FileUtils.mkdir_p($report_path)
 ### runner cannot serve it.
 if $scan_mode == "advance"
   $advance_summary = try_advance_scan()
-  publish_and_finish("advance", $advance_summary, [MOBSF_REPORT_FILENAME], []) if $advance_summary != nil
+  publish_and_finish("advance", $advance_summary, [MOBSF_REPORT_FILENAME]) if $advance_summary != nil
   puts "@@[warning] Falling back to the light scan."
 end
 
-puts "Scanning #{$source_path} (type: #{$scan_type}, formats: #{$output_formats.join(", ")})"
-if $config_path != nil
-  puts "Using mobsfscan config #{$config_path}"
-else
-  puts "No explicit config, a `.mobsf` file at the scan root is picked up automatically"
-end
+print_light_scan_plan()
 
+print_stage(1, "Installing the scanner")
 create_virtualenv(get_python_executable(), $venv_path)
 install_mobsfscan($venv_path, $mobsfscan_version)
 
-### JSON is always produced, it is the report the threshold decision is made
-### from. It is only published as an artifact when the user asked for it.
+### JSON is always produced, it is the report the gate decision is made from.
+### It is only published as an artifact when the user asked for it.
+print_stage(2, "Scanning the source code")
 scan_formats = ["json"]
 $output_formats.each { |format| scan_formats.push(format) unless scan_formats.include?(format) }
-scan_formats.each { |format| run_scan(format) }
+scan_formats.each do |format|
+  if $output_formats.include?(format)
+    puts "Writing the #{format} report as #{OUTPUT_FORMATS[format][:filename]}"
+  else
+    puts "Writing an internal #{format} report to grade the findings, it is not published"
+  end
+  run_scan(format)
+end
 
+print_stage(3, "Grading the findings")
 $report = parse_report("#{$report_path}/#{OUTPUT_FORMATS["json"][:filename]}")
 check_scan_errors($report)
 
 publish_and_finish("light", summarize_report($report),
-                   $output_formats.map { |format| OUTPUT_FORMATS[format][:filename] },
-                   $output_formats)
+                   $output_formats.map { |format| OUTPUT_FORMATS[format][:filename] })
 
 end # if __FILE__ == $PROGRAM_NAME

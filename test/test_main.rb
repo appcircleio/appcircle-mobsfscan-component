@@ -132,7 +132,7 @@ require_relative '../main.rb'
 INPUT_KEYS = %w[
   AC_REPOSITORY_DIR AC_STEP_TEMP AC_TEMP_DIR AC_OUTPUT_DIR AC_ENV_FILE_PATH
   AC_MOBSFSCAN_SOURCE_PATH AC_MOBSFSCAN_SCAN_TYPE AC_MOBSFSCAN_VERSION
-  AC_MOBSFSCAN_OUTPUT_FORMATS AC_MOBSFSCAN_SEVERITY_THRESHOLD
+  AC_MOBSFSCAN_OUTPUT_FORMATS AC_MOBSFSCAN_SEVERITY_THRESHOLD AC_MOBSFSCAN_MIN_SCORE
   AC_MOBSFSCAN_CONFIG_PATH AC_MOBSFSCAN_SAVE_REPORT AC_MOBSFSCAN_TIMEOUT
   AC_MOBSFSCAN_EXTRA_PARAMETERS AC_MOBSFSCAN_SCAN_MODE AC_MOBSFSCAN_ADVANCE_TIMEOUT
   PIP_INDEX_URL PIP_NO_INDEX PIP_FIND_LINKS
@@ -154,6 +154,7 @@ def reset_inputs
   ENV.delete('PIP_EXTRA_INDEX_URL')
   $scan_mode = nil
   $step_temp = nil
+  $minimum_score = nil
 end
 
 # abort_script writes to $stderr and raises SystemExit. Returns the message, or
@@ -248,7 +249,7 @@ def run_main(source, env = {}, fake_mobsf = nil)
       stderr: stderr_str,
       success: status.success?,
       outputs: outputs,
-      output_dir: File.join(output_dir, 'mobsfscan_output'),
+      output_dir: output_dir,
       mobsf_args: File.file?(args_file) ? File.read(args_file).strip : nil,
       mobsf_zip: File.join(workspace, 'received.zip')
     })
@@ -717,15 +718,15 @@ RSpec.describe '#get_scan_command' do
 
   context 'positive path' do
     it 'uses the virtualenv entry point and the format flag' do
-      command = get_scan_command('sarif', '/out/mobsfscan.sarif')
+      command = get_scan_command('sarif', '/out/mobsf-source-code-analyze.sarif')
       expect(command[0]).to eq('/venv/bin/mobsfscan')
       expect(command).to include('--sarif')
     end
 
     it 'passes the type and the output file' do
-      command = get_scan_command('json', '/out/mobsfscan.json')
+      command = get_scan_command('json', '/out/mobsf-source-code-analyze.json')
       expect(command[command.index('--type'), 2]).to eq(%w[--type android])
-      expect(command[command.index('-o'), 2]).to eq(['-o', '/out/mobsfscan.json'])
+      expect(command[command.index('-o'), 2]).to eq(['-o', '/out/mobsf-source-code-analyze.json'])
     end
 
     # The step decides the outcome from the report, so the tool must never fail.
@@ -845,7 +846,7 @@ RSpec.describe '#parse_report' do
   context 'positive path' do
     it 'returns the parsed report' do
       Dir.mktmpdir do |dir|
-        path = File.join(dir, 'mobsfscan.json')
+        path = File.join(dir, 'mobsf-source-code-analyze.json')
         File.write(path, JSON.dump(build_report({})))
         expect(parse_report(path)['mobsfscan_version']).to eq('1.0.0')
       end
@@ -855,14 +856,14 @@ RSpec.describe '#parse_report' do
   # A missing or broken report means the tool failed, it is not a clean result.
   context 'negative path – report missing' do
     it 'aborts with a distinct message' do
-      expect(capture_abort { parse_report('/nope/mobsfscan.json') }).to include('did not produce a report')
+      expect(capture_abort { parse_report('/nope/mobsf-source-code-analyze.json') }).to include('did not produce a report')
     end
   end
 
   context 'negative path – report unparseable' do
     it 'aborts with a distinct message' do
       Dir.mktmpdir do |dir|
-        path = File.join(dir, 'mobsfscan.json')
+        path = File.join(dir, 'mobsf-source-code-analyze.json')
         File.write(path, 'Traceback (most recent call last):')
         expect(capture_abort { parse_report(path) }).to include('could not be parsed')
       end
@@ -987,28 +988,92 @@ RSpec.describe '#get_step_outputs' do
 
   context 'positive path' do
     it 'exports the counts and the highest severity' do
-      outputs = get_step_outputs(summary, '/reports', %w[sarif json])
+      outputs = get_step_outputs(summary)
       expect(outputs['AC_MOBSFSCAN_FINDING_COUNT']).to eq(1)
       expect(outputs['AC_MOBSFSCAN_CRITICAL_COUNT']).to eq(1)
       expect(outputs['AC_MOBSFSCAN_WORST_LEVEL']).to eq('critical')
     end
 
-    # Only the JSON path is exported. The other formats are still produced,
-    # they are just collected from the artifact folder rather than a variable.
-    it 'exports the JSON report path when json was requested' do
-      outputs = get_step_outputs(summary, '/reports', %w[sarif json])
-      expect(outputs['AC_MOBSFSCAN_JSON_REPORT_PATH']).to eq('/reports/mobsfscan.json')
-      expect(outputs.keys.grep(/SARIF/)).to be_empty
-    end
-
-    it 'omits the path of a format that was not requested' do
-      outputs = get_step_outputs(summary, '/reports', %w[sarif])
-      expect(outputs).not_to have_key('AC_MOBSFSCAN_JSON_REPORT_PATH')
+    # The reports are published into AC_OUTPUT_DIR under a fixed name, so no
+    # report path is exported any more.
+    it 'exports no report path' do
+      expect(get_step_outputs(summary).keys.grep(/REPORT_PATH/)).to be_empty
     end
 
     it 'reports NONE as the highest severity for a clean scan' do
-      outputs = get_step_outputs(summarize_report(build_report({})), '/reports', %w[json])
+      outputs = get_step_outputs(summarize_report(build_report({})))
       expect(outputs['AC_MOBSFSCAN_WORST_LEVEL']).to eq('none')
+    end
+  end
+end
+
+# ─── 20b. get_minimum_score ───────────────────────────────────────────────────
+RSpec.describe '#get_minimum_score' do
+  before { reset_inputs }
+  after { reset_inputs }
+
+  context 'positive path' do
+    it 'defaults to no score gate' do
+      expect(get_minimum_score()).to be_nil
+    end
+
+    it 'reads a configured score' do
+      ENV['AC_MOBSFSCAN_MIN_SCORE'] = '45'
+      expect(get_minimum_score()).to eq(45)
+    end
+
+    it 'accepts zero' do
+      ENV['AC_MOBSFSCAN_MIN_SCORE'] = '0'
+      expect(get_minimum_score()).to eq(0)
+    end
+  end
+
+  context 'negative path' do
+    it 'rejects a score above 100' do
+      ENV['AC_MOBSFSCAN_MIN_SCORE'] = '120'
+      expect(capture_abort { get_minimum_score() }).to include('between 0 and 100')
+    end
+
+    it 'rejects a non-numeric score' do
+      ENV['AC_MOBSFSCAN_MIN_SCORE'] = 'high'
+      expect(capture_abort { get_minimum_score() }).to include('between 0 and 100')
+    end
+  end
+end
+
+# ─── 20c. get_gate_failure ────────────────────────────────────────────────────
+# The level gate and the score gate are independent, and both run on every
+# scan: either one on its own breaks the pipeline.
+RSpec.describe '#get_gate_failure' do
+  let(:with_error) { summarize_report(build_report('weak_cipher' => build_rule('ERROR', 1))) }
+  let(:clean) { summarize_report(build_report({})) }
+  let(:scored) { summarize_mobsf_report('appsec' => { 'security_score' => 30, 'warning' => [{}] }) }
+
+  context 'positive path – pipeline continues' do
+    it 'passes a clean report with no score gate' do
+      expect(get_gate_failure(clean, 'low', nil, 'mobsfscan')).to be_nil
+    end
+
+    it 'passes a score at the minimum' do
+      expect(get_gate_failure(scored, 'none', 30, 'MobSF')).to be_nil
+    end
+
+    # The light scan reports no score, so the score gate has nothing to read.
+    it 'skips the score gate when the report carries no score' do
+      expect(get_gate_failure(clean, 'none', 100, 'mobsfscan')).to be_nil
+    end
+  end
+
+  context 'negative path – pipeline breaks' do
+    it 'breaks on the level gate' do
+      expect(get_gate_failure(with_error, 'critical', nil, 'mobsfscan'))
+        .to include('`critical` finding or worse')
+    end
+
+    # `none` disables the level gate only, the score gate still applies.
+    it 'breaks on the score gate while the level gate is none' do
+      expect(get_gate_failure(scored, 'none', 50, 'MobSF'))
+        .to include('30 is below the required 50')
     end
   end
 end
@@ -1398,7 +1463,7 @@ RSpec.describe 'main.rb end to end' do
         expect(result[:success]).to be(true), "step failed:\n#{result[:stdout]}\n#{result[:stderr]}"
         expect(result[:stdout]).not_to include('semgrep not found')
 
-        report = read_json_report(result, 'mobsfscan.json')
+        report = read_json_report(result, 'mobsf-source-code-analyze.json')
         expect(report['errors']).to be_empty
 
         matched = report['results'].reject { |_id, detail| (detail['files'] || []).empty? }
@@ -1419,7 +1484,7 @@ RSpec.describe 'main.rb end to end' do
     it 'reports findings from the Swift sample' do
       run_main('ios') do |result|
         expect(result[:success]).to be(true), "step failed:\n#{result[:stdout]}\n#{result[:stderr]}"
-        matched = read_json_report(result, 'mobsfscan.json')['results']
+        matched = read_json_report(result, 'mobsf-source-code-analyze.json')['results']
                   .reject { |_id, detail| (detail['files'] || []).empty? }
         expect(matched).not_to be_empty
         expect(matched.keys.any? { |id| id.start_with?('ios_') }).to be true
@@ -1428,19 +1493,17 @@ RSpec.describe 'main.rb end to end' do
   end
 
   context 'positive path – report publishing' do
-    it 'publishes the SARIF and JSON reports as artifacts and exports their paths' do
+    it 'publishes the SARIF and JSON reports as artifacts under their own names' do
       run_main('android') do |result|
         expect(result[:success]).to be true
-        expect(File.file?(File.join(result[:output_dir], 'mobsfscan.json'))).to be true
-        expect(File.file?(File.join(result[:output_dir], 'mobsfscan.sarif'))).to be true
+        expect(File.file?(File.join(result[:output_dir], 'mobsf-source-code-analyze.json'))).to be true
+        expect(File.file?(File.join(result[:output_dir], 'mobsf-source-code-analyze.sarif'))).to be true
 
-        sarif = read_json_report(result, 'mobsfscan.sarif')
+        sarif = read_json_report(result, 'mobsf-source-code-analyze.sarif')
         expect(sarif['version']).to eq('2.1.0')
         expect(sarif['runs'].first['results']).not_to be_empty
 
-        expect(result[:outputs]['AC_MOBSFSCAN_JSON_REPORT_PATH'])
-          .to eq(File.join(result[:output_dir], 'mobsfscan.json'))
-        expect(result[:outputs].keys.grep(/SARIF/)).to be_empty
+        expect(result[:outputs].keys.grep(/REPORT_PATH/)).to be_empty
         expect(result[:outputs]['AC_MOBSFSCAN_FINDING_COUNT'].to_i).to be > 0
         expect(%w[critical normal low]).to include(result[:outputs]['AC_MOBSFSCAN_WORST_LEVEL'])
       end
@@ -1450,8 +1513,8 @@ RSpec.describe 'main.rb end to end' do
     it 'does not publish the JSON report when only SARIF is requested' do
       run_main('android', 'AC_MOBSFSCAN_OUTPUT_FORMATS' => 'sarif') do |result|
         expect(result[:success]).to be true
-        expect(File.file?(File.join(result[:output_dir], 'mobsfscan.sarif'))).to be true
-        expect(File.exist?(File.join(result[:output_dir], 'mobsfscan.json'))).to be false
+        expect(File.file?(File.join(result[:output_dir], 'mobsf-source-code-analyze.sarif'))).to be true
+        expect(File.exist?(File.join(result[:output_dir], 'mobsf-source-code-analyze.json'))).to be false
       end
     end
 
@@ -1459,8 +1522,8 @@ RSpec.describe 'main.rb end to end' do
     it 'publishes only SARIF by default' do
       run_main('android', 'AC_MOBSFSCAN_OUTPUT_FORMATS' => nil) do |result|
         expect(result[:success]).to be true
-        expect(File.file?(File.join(result[:output_dir], 'mobsfscan.sarif'))).to be true
-        expect(File.exist?(File.join(result[:output_dir], 'mobsfscan.json'))).to be false
+        expect(File.file?(File.join(result[:output_dir], 'mobsf-source-code-analyze.sarif'))).to be true
+        expect(File.exist?(File.join(result[:output_dir], 'mobsf-source-code-analyze.json'))).to be false
       end
     end
   end
@@ -1470,7 +1533,7 @@ RSpec.describe 'main.rb end to end' do
     it 'completes a scan with only AC_TEMP_DIR set' do
       run_main('android', 'AC_STEP_TEMP' => nil) do |result|
         expect(result[:success]).to be(true), "step failed:\n#{result[:stdout]}\n#{result[:stderr]}"
-        expect(File.file?(File.join(result[:output_dir], 'mobsfscan.json'))).to be true
+        expect(File.file?(File.join(result[:output_dir], 'mobsf-source-code-analyze.json'))).to be true
       end
     end
   end
@@ -1479,7 +1542,7 @@ RSpec.describe 'main.rb end to end' do
     it 'honors an explicit ios override on Android source' do
       run_main('android', 'AC_MOBSFSCAN_SCAN_TYPE' => 'ios') do |result|
         expect(result[:success]).to be true
-        expect(read_json_report(result, 'mobsfscan.json')['results']).to be_empty
+        expect(read_json_report(result, 'mobsf-source-code-analyze.json')['results']).to be_empty
       end
     end
   end
@@ -1488,8 +1551,8 @@ RSpec.describe 'main.rb end to end' do
     it 'passes and still produces a report' do
       run_main('clean') do |result|
         expect(result[:success]).to be(true), "step failed:\n#{result[:stdout]}\n#{result[:stderr]}"
-        expect(File.file?(File.join(result[:output_dir], 'mobsfscan.json'))).to be true
-        matched = read_json_report(result, 'mobsfscan.json')['results']
+        expect(File.file?(File.join(result[:output_dir], 'mobsf-source-code-analyze.json'))).to be true
+        matched = read_json_report(result, 'mobsf-source-code-analyze.json')['results']
                   .reject { |_id, detail| (detail['files'] || []).empty? }
         expect(matched).to be_empty
         expect(result[:outputs]['AC_MOBSFSCAN_CRITICAL_COUNT']).to eq('0')
@@ -1501,7 +1564,7 @@ RSpec.describe 'main.rb end to end' do
     it 'drops a single finding suppressed with an inline mobsf-ignore comment' do
       run_main('android') do |result|
         expect(result[:success]).to be(true), "step failed:\n#{result[:stdout]}\n#{result[:stderr]}"
-        reported = read_json_report(result, 'mobsfscan.json')['results'].values
+        reported = read_json_report(result, 'mobsf-source-code-analyze.json')['results'].values
                    .flat_map { |detail| detail['files'] || [] }
                    .map { |match| File.basename(match['file_path']) }
         expect(reported).not_to include('SuppressedCode.java')
@@ -1515,7 +1578,7 @@ RSpec.describe 'main.rb end to end' do
                    "ignore-rules:\n  - hardcoded_api_key\n  - hardcoded_password\n  - hardcoded_secret\n")
         run_main('android', 'AC_REPOSITORY_DIR' => repo) do |result|
           expect(result[:success]).to be true
-          rules = read_json_report(result, 'mobsfscan.json')['results'].keys
+          rules = read_json_report(result, 'mobsf-source-code-analyze.json')['results'].keys
           expect(rules).not_to include('hardcoded_api_key')
           expect(rules).not_to include('hardcoded_password')
         end
@@ -1537,7 +1600,7 @@ RSpec.describe 'main.rb end to end' do
       run_main('android', 'AC_MOBSFSCAN_SEVERITY_THRESHOLD' => 'normal') do |result|
         expect(result[:success]).to be false
         expect(result[:stdout] + result[:stderr]).to include('breaks the')
-        expect(File.file?(File.join(result[:output_dir], 'mobsfscan.json'))).to be true
+        expect(File.file?(File.join(result[:output_dir], 'mobsf-source-code-analyze.json'))).to be true
       end
     end
 
@@ -1602,7 +1665,7 @@ RSpec.describe 'main.rb advance mode end to end' do
         expect(result[:outputs]['AC_MOBSFSCAN_SECURITY_SCORE']).to eq('67')
         expect(result[:outputs]['AC_MOBSFSCAN_NORMAL_COUNT']).to eq('2')
         expect(result[:outputs]['AC_MOBSFSCAN_WORST_LEVEL']).to eq('normal')
-        expect(File.file?(File.join(result[:output_dir], 'mobsf-report.json'))).to be true
+        expect(File.file?(File.join(result[:output_dir], 'mobsf-source-code-analyze.json'))).to be true
 
         # It must never install mobsfscan when the advance scan served the build.
         expect(result[:stdout]).not_to include('Installing mobsfscan')
@@ -1637,7 +1700,7 @@ RSpec.describe 'main.rb advance mode end to end' do
         expect(result[:success]).to be false
         expect(result[:stdout] + result[:stderr]).to include('breaks the')
         # The report is still published on the failing path.
-        expect(File.file?(File.join(result[:output_dir], 'mobsf-report.json'))).to be true
+        expect(File.file?(File.join(result[:output_dir], 'mobsf-source-code-analyze.json'))).to be true
       end
     end
   end
@@ -1650,7 +1713,7 @@ RSpec.describe 'main.rb advance mode end to end' do
         expect(result[:success]).to be(true), "step failed:\n#{result[:stdout]}\n#{result[:stderr]}"
         expect(result[:stdout]).to include('No MobSF installation found')
         expect(result[:outputs]['AC_MOBSFSCAN_SCAN_MODE_USED']).to be_nil
-        expect(File.file?(File.join(result[:output_dir], 'mobsfscan.json'))).to be true
+        expect(File.file?(File.join(result[:output_dir], 'mobsf-source-code-analyze.json'))).to be true
       end
     end
 
@@ -1659,7 +1722,7 @@ RSpec.describe 'main.rb advance mode end to end' do
                { report: mobsf_report }) do |result|
         expect(result[:success]).to be true
         expect(result[:stdout]).to include('does not look like an Android or iOS project')
-        expect(File.file?(File.join(result[:output_dir], 'mobsfscan.json'))).to be true
+        expect(File.file?(File.join(result[:output_dir], 'mobsf-source-code-analyze.json'))).to be true
       end
     end
 

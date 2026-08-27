@@ -16,7 +16,10 @@ DEFAULT_ADVANCE_TIMEOUT = 1800
 DEFAULT_MOBSF_PREFIXES = ["/usr/local/appcircle/mobsf", "/opt/appcircle/mobsf"]
 MOBSF_MANIFEST_FILE = "appcircle-mobsf-manifest.json"
 MOBSF_CONTROL_SCRIPT = "mobsf-control.sh"
-MOBSF_REPORT_FILENAME = "mobsf-report.json"
+# The same base name the light scan publishes under, so the artifact reads the
+# same whichever mode ran. Kept literal: main.rb defines REPORT_BASENAME after
+# it requires this file.
+MOBSF_REPORT_FILENAME = "mobsf-source-code-analyze.json"
 SOURCE_ZIP_FILENAME = "mobsf-source.zip"
 
 # mobsf-control.sh exit codes that the step reacts to.
