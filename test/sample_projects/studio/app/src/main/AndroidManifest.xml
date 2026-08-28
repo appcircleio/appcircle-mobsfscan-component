@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Minimal manifest so the tree matches the Android Studio layout MobSF
+     requires for a source code zip scan. -->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    package="com.example.studio">
+    <application
+        android:allowBackup="true"
+        android:label="StudioSample">
+        <activity android:name=".MainActivity" android:exported="true" />
+    </application>
+</manifest>
