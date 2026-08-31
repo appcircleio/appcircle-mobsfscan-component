@@ -127,8 +127,6 @@ end
 require_relative '../main.rb'
 
 # ─── Global State Helpers ─────────────────────────────────────────────────────
-# main.rb keeps its configuration in globals that are assigned only when it runs
-# as the main script, so the unit tests set them directly.
 INPUT_KEYS = %w[
   AC_REPOSITORY_DIR AC_STEP_TEMP AC_TEMP_DIR AC_OUTPUT_DIR AC_ENV_FILE_PATH
   AC_MOBSFSCAN_SOURCE_PATH AC_MOBSFSCAN_SCAN_TYPE AC_MOBSFSCAN_VERSION
@@ -157,8 +155,6 @@ def reset_inputs
   $minimum_score = nil
 end
 
-# abort_script writes to $stderr and raises SystemExit. Returns the message, or
-# nil when the block did not abort.
 def capture_abort
   buffer = StringIO.new
   original = $stderr
@@ -200,12 +196,6 @@ def build_rule(severity, file_count)
 end
 
 # ─── Subprocess Helper ────────────────────────────────────────────────────────
-# Runs main.rb in a child process with a controlled ENV, the way the runner does.
-# Nil values explicitly unset keys inherited from the parent process.
-#
-# Report content assertions must not depend on the severity gate, so the helper
-# scans in report only mode. The threshold examples set their own value, and
-# passing nil for a key exercises the step's own default.
 def run_main(source, env = {}, fake_mobsf = nil)
   Dir.mktmpdir do |workspace|
     step_temp = File.join(workspace, 'step_temp')
@@ -256,17 +246,12 @@ def run_main(source, env = {}, fake_mobsf = nil)
   end
 end
 
-# Installing mobsfscan from pypi.org costs minutes per example.
-# MOBSFSCAN_WHEELHOUSE points the install at a local wheel directory instead,
-# which also exercises the air gapped path. Examples that cover the install
-# itself opt out.
 def wheelhouse_input(env)
   wheelhouse = ENV['MOBSFSCAN_WHEELHOUSE']
   return {} if wheelhouse.nil? || wheelhouse.empty?
   return {} if %w[AC_MOBSFSCAN_VERSION PIP_INDEX_URL
                   PIP_FIND_LINKS].any? { |key| env.key?(key) }
 
-  # pip's own variables, which is also how an air gapped runner is configured.
   return { 'PIP_NO_INDEX' => '1', 'PIP_FIND_LINKS' => wheelhouse }
 end
 
@@ -350,7 +335,6 @@ RSpec.describe '#get_step_temp' do
     end
   end
 
-  # A Custom Script does not get AC_STEP_TEMP, only the documented AC_TEMP_DIR.
   context 'positive path – running as a Custom Script' do
     it 'falls back to its own folder under AC_TEMP_DIR' do
       ENV['AC_TEMP_DIR'] = '/tmp/build-temp'
@@ -405,8 +389,6 @@ RSpec.describe '#mask_secrets' do
     end
   end
 
-  # An internal index is configured through pip's own environment variables, and
-  # such a URL usually carries credentials.
   context 'positive path – PIP_INDEX_URL configured' do
     it 'replaces the credentialed URL with a placeholder' do
       ENV['PIP_INDEX_URL'] = 'https://user:token@pypi.internal/simple'
@@ -470,11 +452,63 @@ RSpec.describe '#run_command' do
     end
   end
 
+  context 'positive path – output larger than the pipe buffer' do
+    it 'captures every line' do
+      stdout_str = nil
+      capture_stdout do
+        stdout_str, = run_command(['sh', '-c', 'i=0; while [ $i -lt 20000 ]; do ' \
+                                   'echo "line $i"; i=$((i+1)); done'], true, 60)
+      end
+      expect(stdout_str.lines.length).to eq(20_000)
+      expect(stdout_str.lines.last.strip).to eq('line 19999')
+    end
+  end
+
   context 'negative path – timeout exceeded' do
     it 'terminates the command so a stuck scan cannot hang the build' do
       message = nil
       capture_stdout { message = capture_abort { run_command(%w[sleep 30], true, 1) } }
       expect(message).to include('exceeded the 1 second timeout')
+    end
+
+    it 'fires at the timeout rather than after the kill grace period' do
+      elapsed = nil
+      capture_stdout do
+        capture_abort do
+          started = monotonic_now()
+          run_command(%w[sleep 30], true, 1)
+        ensure
+          elapsed = monotonic_now() - started
+        end
+      end
+      expect(elapsed).to be < 2.5
+    end
+
+    it 'does not wait on a background process that outlived the command' do
+      stdout_str = nil
+      exit_code = nil
+      elapsed = nil
+      capture_stdout do
+        started = monotonic_now()
+        stdout_str, _stderr_str, exit_code = run_command(
+          ['sh', '-c', 'sleep 30 & echo started'], true, 2)
+        elapsed = monotonic_now() - started
+      end
+      expect(elapsed).to be < 5
+      expect(stdout_str.strip).to eq('started')
+      expect(exit_code).to eq(0)
+    end
+
+    it 'escalates to KILL when the command ignores TERM' do
+      message = nil
+      elapsed = nil
+      capture_stdout do
+        started = monotonic_now()
+        message = capture_abort { run_command(['sh', '-c', 'trap "" TERM; sleep 30'], true, 1) }
+        elapsed = monotonic_now() - started
+      end
+      expect(message).to include('exceeded the 1 second timeout')
+      expect(elapsed).to be < 10
     end
   end
 end
@@ -585,7 +619,6 @@ RSpec.describe '#get_output_formats' do
       expect(get_output_formats).to eq(%w[sarif])
     end
 
-    # The step form offers one format, but the variable still takes a list.
     it 'still accepts a comma separated list' do
       ENV['AC_MOBSFSCAN_OUTPUT_FORMATS'] = 'sarif,json,html'
       expect(get_output_formats).to eq(%w[sarif json html])
@@ -638,6 +671,16 @@ RSpec.describe '#get_scan_timeout' do
 
     it 'aborts on a non-numeric value' do
       ENV['AC_MOBSFSCAN_TIMEOUT'] = 'soon'
+      expect { get_scan_timeout }.to raise_error(SystemExit)
+    end
+
+    it 'aborts on a value with a unit suffix instead of reading 15 seconds' do
+      ENV['AC_MOBSFSCAN_TIMEOUT'] = '15m'
+      expect { get_scan_timeout }.to raise_error(SystemExit)
+    end
+
+    it 'aborts on exponent notation instead of reading 1 second' do
+      ENV['AC_MOBSFSCAN_TIMEOUT'] = '1e3'
       expect { get_scan_timeout }.to raise_error(SystemExit)
     end
   end
@@ -729,7 +772,6 @@ RSpec.describe '#get_scan_command' do
       expect(command[command.index('-o'), 2]).to eq(['-o', '/out/mobsf-source-code-analyze.json'])
     end
 
-    # The step decides the outcome from the report, so the tool must never fail.
     it 'always passes --no-fail' do
       expect(get_scan_command('json', '/out/r.json')).to include('--no-fail')
     end
@@ -778,8 +820,6 @@ RSpec.describe '#get_pip_install_command' do
     end
   end
 
-  # An internal index or an offline wheel directory is configured through pip's
-  # own environment variables, so the command itself never carries them.
   context 'positive path – index configured through the environment' do
     it 'keeps the command free of index flags' do
       ENV['PIP_INDEX_URL'] = 'https://pypi.internal/simple'
@@ -792,7 +832,6 @@ end
 
 # ─── 14. venv_environment ─────────────────────────────────────────────────────
 RSpec.describe '#venv_environment' do
-  # mobsfscan shells out to semgrep, so the venv bin directory has to be on PATH.
   context 'positive path' do
     it 'prepends the virtualenv bin directory to PATH' do
       expect(venv_environment('/venv')['PATH']).to start_with("/venv/bin#{File::PATH_SEPARATOR}")
@@ -853,7 +892,6 @@ RSpec.describe '#parse_report' do
     end
   end
 
-  # A missing or broken report means the tool failed, it is not a clean result.
   context 'negative path – report missing' do
     it 'aborts with a distinct message' do
       expect(capture_abort { parse_report('/nope/mobsf-source-code-analyze.json') }).to include('did not produce a report')
@@ -886,8 +924,6 @@ RSpec.describe '#check_scan_errors' do
     end
   end
 
-  # A silently semgrep-less install reports only best practice rules, which
-  # would otherwise look like a clean project.
   context 'negative path – semgrep missing' do
     it 'aborts instead of reporting a clean scan' do
       message = nil
@@ -914,7 +950,6 @@ RSpec.describe '#summarize_report' do
     end
   end
 
-  # Best practice rules carry no file location and must stay distinguishable.
   context 'positive path – rules without a file location' do
     it 'counts them as missing best practices' do
       summary = summarize_report(build_report('android_certificate_pinning' => build_rule('INFO', 0),
@@ -994,8 +1029,6 @@ RSpec.describe '#get_step_outputs' do
       expect(outputs['AC_MOBSFSCAN_WORST_LEVEL']).to eq('critical')
     end
 
-    # The reports are published into AC_OUTPUT_DIR under a fixed name, so no
-    # report path is exported any more.
     it 'exports no report path' do
       expect(get_step_outputs(summary).keys.grep(/REPORT_PATH/)).to be_empty
     end
@@ -1013,8 +1046,8 @@ RSpec.describe '#get_minimum_score' do
   after { reset_inputs }
 
   context 'positive path' do
-    it 'defaults to no score gate' do
-      expect(get_minimum_score()).to be_nil
+    it 'defaults to 0' do
+      expect(get_minimum_score()).to eq(0)
     end
 
     it 'reads a configured score' do
@@ -1022,9 +1055,9 @@ RSpec.describe '#get_minimum_score' do
       expect(get_minimum_score()).to eq(45)
     end
 
-    it 'accepts zero' do
-      ENV['AC_MOBSFSCAN_MIN_SCORE'] = '0'
-      expect(get_minimum_score()).to eq(0)
+    it 'reads 100 as the strictest gate' do
+      ENV['AC_MOBSFSCAN_MIN_SCORE'] = '100'
+      expect(get_minimum_score()).to eq(100)
     end
   end
 
@@ -1038,27 +1071,38 @@ RSpec.describe '#get_minimum_score' do
       ENV['AC_MOBSFSCAN_MIN_SCORE'] = 'high'
       expect(capture_abort { get_minimum_score() }).to include('between 0 and 100')
     end
+
+    it 'rejects a fractional score' do
+      ENV['AC_MOBSFSCAN_MIN_SCORE'] = '45.5'
+      expect(capture_abort { get_minimum_score() }).to include('between 0 and 100')
+    end
+
+    it 'rejects exponent notation' do
+      ENV['AC_MOBSFSCAN_MIN_SCORE'] = '1e2'
+      expect(capture_abort { get_minimum_score() }).to include('between 0 and 100')
+    end
   end
 end
 
 # ─── 20c. get_gate_failure ────────────────────────────────────────────────────
-# The level gate and the score gate are independent, and both run on every
-# scan: either one on its own breaks the pipeline.
 RSpec.describe '#get_gate_failure' do
   let(:with_error) { summarize_report(build_report('weak_cipher' => build_rule('ERROR', 1))) }
   let(:clean) { summarize_report(build_report({})) }
   let(:scored) { summarize_mobsf_report('appsec' => { 'security_score' => 30, 'warning' => [{}] }) }
 
   context 'positive path – pipeline continues' do
-    it 'passes a clean report with no score gate' do
-      expect(get_gate_failure(clean, 'low', nil, 'mobsfscan')).to be_nil
+    it 'passes a clean report with the score gate at its default' do
+      expect(get_gate_failure(clean, 'low', 0, 'mobsfscan')).to be_nil
     end
 
     it 'passes a score at the minimum' do
       expect(get_gate_failure(scored, 'none', 30, 'MobSF')).to be_nil
     end
 
-    # The light scan reports no score, so the score gate has nothing to read.
+    it 'passes any score when the gate is 0' do
+      expect(get_gate_failure(scored, 'none', 0, 'MobSF')).to be_nil
+    end
+
     it 'skips the score gate when the report carries no score' do
       expect(get_gate_failure(clean, 'none', 100, 'mobsfscan')).to be_nil
     end
@@ -1066,11 +1110,10 @@ RSpec.describe '#get_gate_failure' do
 
   context 'negative path – pipeline breaks' do
     it 'breaks on the level gate' do
-      expect(get_gate_failure(with_error, 'critical', nil, 'mobsfscan'))
+      expect(get_gate_failure(with_error, 'critical', 0, 'mobsfscan'))
         .to include('`critical` finding or worse')
     end
 
-    # `none` disables the level gate only, the score gate still applies.
     it 'breaks on the score gate while the level gate is none' do
       expect(get_gate_failure(scored, 'none', 50, 'MobSF'))
         .to include('30 is below the required 50')
@@ -1135,9 +1178,6 @@ RSpec.describe '#get_mobsf_prefix' do
 end
 
 # ─── 22b. get_mobsf_control ───────────────────────────────────────────────────
-# The script ships with the runner package, not under the MobSF prefix, so the
-# search walks up from the prefix and the step's working directory. A dev macOS
-# runner has MobSF at /usr/local/appcircle/mobsf with the script one level up.
 RSpec.describe '#get_mobsf_control' do
   before { reset_inputs }
   after { reset_inputs }
@@ -1195,8 +1235,6 @@ RSpec.describe '#get_mobsf_control' do
 end
 
 # ─── 23. detect_source_layout ─────────────────────────────────────────────────
-# Mirrors MobSF's valid_source_code(): anything it would reject is detected
-# here first, so the step can fall back instead of paying for a failed upload.
 RSpec.describe '#detect_source_layout' do
   def studio_project(root, nested: false)
     base = nested ? File.join(root, 'MyApp') : root
@@ -1327,8 +1365,6 @@ RSpec.describe '#get_advance_failure_message' do
 end
 
 # ─── 27. summarize_mobsf_report ───────────────────────────────────────────────
-# MobSF grades high/warning/info/secure/hotspot; the gate reuses the light
-# mode vocabulary, so the appsec section is normalized onto it.
 RSpec.describe '#summarize_mobsf_report' do
   def appsec_report(appsec)
     { 'appsec' => appsec }
@@ -1378,7 +1414,6 @@ RSpec.describe '#summarize_mobsf_report' do
       expect(summary[:highest]).to be_nil
     end
 
-    # secure and hotspot are not failures, so they must not trip the gate.
     it 'does not fail the gate on secure or hotspot entries alone' do
       summary = summarize_mobsf_report(appsec_report('secure' => [{}], 'hotspot' => [{}]))
       expect(is_threshold_exceeded(summary, 'low')).to be false
@@ -1386,16 +1421,7 @@ RSpec.describe '#summarize_mobsf_report' do
   end
 end
 
-
 # ─── Fake MobSF Runner Helper ─────────────────────────────────────────────────
-# There is no provisioned MobSF on a dev machine, so the advance path is driven
-# against a stand-in mobsf-control.sh that honours the documented contract: it
-# validates the arguments, writes the report to --output and returns one of the
-# documented exit codes.
-#
-# It is planted the way a real runner is laid out, with MobSF under its own
-# prefix and the control script in a scripts/ directory further up, so the
-# step's own discovery has to find both. The step exposes no path inputs.
 def plant_fake_mobsf(workspace, report, exit_code)
   prefix = File.join(workspace, 'mobsf')
   FileUtils.mkdir_p(prefix)
@@ -1411,7 +1437,6 @@ def plant_fake_mobsf(workspace, report, exit_code)
 
   File.write(control, <<~SH)
     #!/bin/sh
-    # Records the invocation, then behaves like mobsf-control.sh --action scan.
     echo "$@" > "#{workspace}/last-args"
     output=""
     file=""
@@ -1452,8 +1477,6 @@ def mobsf_report(high: 0, warning: 0, info: 0, secure: 0, hotspot: 0, score: 67)
 end
 
 # ─── 28. End to end ───────────────────────────────────────────────────────────
-# Runs main.rb the way the runner does, against the deliberately insecure
-# samples. Needs python3 and a reachable Python package index.
 RSpec.describe 'main.rb end to end' do
   before { skip 'set MOBSFSCAN_E2E=1 to run the end to end tests' unless e2e_enabled? }
 
@@ -1509,7 +1532,6 @@ RSpec.describe 'main.rb end to end' do
       end
     end
 
-    # JSON is always generated for the gate, but it is not an artifact unless asked for.
     it 'does not publish the JSON report when only SARIF is requested' do
       run_main('android', 'AC_MOBSFSCAN_OUTPUT_FORMATS' => 'sarif') do |result|
         expect(result[:success]).to be true
@@ -1518,7 +1540,6 @@ RSpec.describe 'main.rb end to end' do
       end
     end
 
-    # The step form offers a single format, and the default matches it.
     it 'publishes only SARIF by default' do
       run_main('android', 'AC_MOBSFSCAN_OUTPUT_FORMATS' => nil) do |result|
         expect(result[:success]).to be true
@@ -1528,7 +1549,6 @@ RSpec.describe 'main.rb end to end' do
     end
   end
 
-  # This is the path a Custom Script takes, where AC_STEP_TEMP is not provided.
   context 'positive path – AC_TEMP_DIR fallback' do
     it 'completes a scan with only AC_TEMP_DIR set' do
       run_main('android', 'AC_STEP_TEMP' => nil) do |result|
@@ -1587,7 +1607,6 @@ RSpec.describe 'main.rb end to end' do
   end
 
   context 'negative path – severity threshold' do
-    # The insecure Android sample carries an ERROR finding.
     it 'fails the build at the default critical gate' do
       run_main('android', 'AC_MOBSFSCAN_SEVERITY_THRESHOLD' => nil) do |result|
         expect(result[:success]).to be false
@@ -1651,7 +1670,6 @@ RSpec.describe 'main.rb end to end' do
   end
 end
 
-
 # ─── 29. End to end – advance mode ────────────────────────────────────────────
 RSpec.describe 'main.rb advance mode end to end' do
   before { skip 'set MOBSFSCAN_E2E=1 to run the end to end tests' unless e2e_enabled? }
@@ -1667,14 +1685,10 @@ RSpec.describe 'main.rb advance mode end to end' do
         expect(result[:outputs]['AC_MOBSFSCAN_WORST_LEVEL']).to eq('normal')
         expect(File.file?(File.join(result[:output_dir], 'mobsf-source-code-analyze.json'))).to be true
 
-        # It must never install mobsfscan when the advance scan served the build.
         expect(result[:stdout]).not_to include('Installing mobsfscan')
       end
     end
 
-    # The step takes no path inputs, so this also covers discovery: the manifest
-    # comes from MOBSF_HOME and the control script from a scripts/ directory
-    # above the step's working directory, exactly as on a real runner.
     it 'discovers the control script and passes the documented arguments with a real zip' do
       run_main('studio',
                { 'AC_MOBSFSCAN_SCAN_MODE' => 'advance', 'AC_MOBSFSCAN_ADVANCE_TIMEOUT' => '1234' },
@@ -1699,14 +1713,11 @@ RSpec.describe 'main.rb advance mode end to end' do
                { report: mobsf_report(high: 1, score: 30) }) do |result|
         expect(result[:success]).to be false
         expect(result[:stdout] + result[:stderr]).to include('breaks the')
-        # The report is still published on the failing path.
         expect(File.file?(File.join(result[:output_dir], 'mobsf-source-code-analyze.json'))).to be true
       end
     end
   end
 
-  # The whole point of the fallback: asking for advance on a runner without
-  # MobSF must still produce a scan, not a failed build.
   context 'positive path – falls back to the light scan' do
     it 'falls back when no MobSF installation is present' do
       run_main('android', 'AC_MOBSFSCAN_SCAN_MODE' => 'advance') do |result|
@@ -1735,8 +1746,6 @@ RSpec.describe 'main.rb advance mode end to end' do
       end
     end
 
-    # A report with no appsec section, such as the redirect marker MobSF can
-    # answer with, leaves nothing to gate on.
     it 'falls back when the report carries no appsec section' do
       run_main('studio', { 'AC_MOBSFSCAN_SCAN_MODE' => 'advance' },
                { report: { 'type' => 'ios' } }) do |result|
