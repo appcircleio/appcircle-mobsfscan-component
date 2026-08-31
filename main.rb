@@ -17,19 +17,12 @@ INSTALL_TIMEOUT = 1800
 VENV_TIMEOUT = 300
 VERSION_TIMEOUT = 120
 
-# mobsfscan 1.0.0 requires Python 3.10+. Older pins accept older interpreters,
-# so a lower version is only a warning and pip gets the final say.
 RECOMMENDED_PYTHON = [3, 10]
 
 SEVERITIES = ["ERROR", "WARNING", "INFO"]
 SEVERITY_RANK = {"INFO" => 1, "WARNING" => 2, "ERROR" => 3}
-# The gate is expressed in the vocabulary the step form offers, mapped onto the
-# severities the two engines report. `none` never fails the build.
 SEVERITY_THRESHOLDS = ["critical", "normal", "low", "none"]
 THRESHOLD_SEVERITY = {"critical" => "ERROR", "normal" => "WARNING", "low" => "INFO"}
-# Both engines grade internally as ERROR/WARNING/INFO. The build log speaks the
-# same words the step form offers instead, so the level a user picked and the
-# level they read back are the same.
 SEVERITY_LABEL = {"ERROR" => "Critical", "WARNING" => "Normal", "INFO" => "Low"}
 
 SCAN_TYPES = ["auto", "android", "ios"]
@@ -38,10 +31,6 @@ SCAN_TYPES = ["auto", "android", "ios"]
 SCAN_MODES = ["light", "advance"]
 DEFAULT_SCAN_MODE = "light"
 
-# Every report is published under the same base name so the artifact is
-# recognizable without opening it. mobsfscan takes a single -o, so each format
-# costs its own run, and the formats are exactly the ones its CLI offers:
-# --json, --sarif, --sonarqube, --gitlab-sast and --html.
 REPORT_BASENAME = "mobsf-source-code-analyze"
 OUTPUT_FORMATS = {
   "json" => {:flag => "--json", :filename => "#{REPORT_BASENAME}.json"},
@@ -74,8 +63,6 @@ def env_default(key, default)
   return (ENV[key] != nil && ENV[key] != "") ? ENV[key].strip : default
 end
 
-# The virtualenv and the reports live here, and the runner discards it when the
-# build ends, so the step has no cleanup to do.
 def get_step_temp()
   step_temp = env_default("AC_STEP_TEMP", nil)
   return step_temp if step_temp != nil
@@ -90,9 +77,6 @@ end
 
 if __FILE__ == $PROGRAM_NAME
 
-#step_temp - AC_STEP_TEMP is set for a marketplace component. A Custom Script
-#            does not get it, so the documented AC_TEMP_DIR is the fallback and
-#            the step keeps its files in its own folder under it.
 $step_temp = get_step_temp()
 
 $repository_path = env_has_key("AC_REPOSITORY_DIR")
@@ -102,7 +86,6 @@ $env_file_path = ENV["AC_ENV_FILE_PATH"]
 $venv_path = "#{$step_temp}/mobsfscan-venv"
 $report_path = "#{$step_temp}/mobsfscan_reports"
 
-#mobsfscan_version - Pinned on purpose, never "latest", so builds stay reproducible
 $mobsfscan_version = env_default("AC_MOBSFSCAN_VERSION", DEFAULT_MOBSFSCAN_VERSION)
 
 #save_report - Options: true, false
@@ -116,9 +99,6 @@ def abort_script(error)
 end
 
 ###### Log Masking
-# An internal package index is configured through pip's own environment
-# variables, and such a URL often embeds credentials, so whatever it holds is
-# scrubbed from the command log and from pip's own output.
 MASKED_ENV_KEYS = ["PIP_INDEX_URL", "PIP_EXTRA_INDEX_URL"]
 
 def mask_secrets(text)
@@ -132,20 +112,8 @@ def mask_secrets(text)
 end
 
 ###### Run Command Function
-# Once the command is gone, everything it wrote is already sitting in the pipe
-# buffer, which a reader consumes in microseconds, so this grace period is only
-# ever spent when something that outlived the command still holds the write
-# end. Two seconds is orders of magnitude more than draining needs and short
-# enough not to be felt. In the normal case a reader sees EOF the moment the
-# command exits and none of it is spent.
 READER_DRAIN_TIMEOUT = 2
-
-# Only spent when the process survived a TERM and a KILL.
 REAP_TIMEOUT = 10
-
-# TERM first so a command can clean up after itself, then KILL. The wait
-# between the two is polled rather than slept through, so a command that stops
-# on TERM does not add its full grace period to every timeout.
 KILL_GRACE_TIMEOUT = 3
 KILL_POLL_INTERVAL = 0.1
 
@@ -153,20 +121,6 @@ def monotonic_now()
   return Process.clock_gettime(Process::CLOCK_MONOTONIC)
 end
 
-# The command is an argv array and is never handed to a shell, so user supplied
-# paths and free form parameters cannot be reinterpreted as shell syntax.
-# Returns stdout, stderr and the exit code.
-#
-# Every wait in here is bounded, because the step's timeout is all that stands
-# between a stuck scan and a build that hangs until the runner's own limit ends
-# it. The timeout used to cover the wait for the process only: the readers were
-# joined afterwards with no bound at all, and a reader sees EOF only once every
-# copy of the pipe's write end is closed. A command that leaves a background
-# process behind hands one of those copies to it, so the step waited on the
-# background process rather than on the command, the timeout never fired, and
-# the command was reported as successful however long that took. That is the
-# unstable part: whether the timeout worked depended on whether the command
-# happened to spawn something that outlived it.
 def run_command(command, skip_abort, timeout = nil, environment = {})
   puts "@@[command] #{mask_secrets(command.shelljoin)}"
 
@@ -179,9 +133,6 @@ def run_command(command, skip_abort, timeout = nil, environment = {})
     abort_script("#{command[0]} was not found on this runner.")
   end
 
-  # popen3's own block form is deliberately not used: its ensure joins the wait
-  # thread with no bound, which reintroduces the unbounded wait this function
-  # exists to avoid.
   begin
     stdin.close
     readers = [read_stream(stdout, stdout_str), read_stream(stderr, stderr_str)]
@@ -198,8 +149,6 @@ def run_command(command, skip_abort, timeout = nil, environment = {})
     abort_script("`#{File.basename(command[0])}` exceeded the #{timeout} second timeout and was terminated.")
   end
 
-  # Only reachable when the process outlived a TERM and a KILL, which means the
-  # step cannot know how it ended and must not guess.
   if status == nil
     abort_script("`#{File.basename(command[0])}` could not be terminated on this runner and did " \
                  "not report an exit code.")
@@ -212,22 +161,15 @@ def run_command(command, skip_abort, timeout = nil, environment = {})
   return stdout_str, stderr_str, status.exitstatus
 end
 
-# The buffer is appended to in place, so the caller keeps whatever arrived even
-# when the pipe is closed under the thread.
 def read_stream(io, buffer)
   return Thread.new do
     begin
       io.each_line { |line| buffer << line }
     rescue IOError, Errno::EBADF
-      # The pipe was closed from under this thread because a process that
-      # outlived the command still held its own copy of the write end.
     end
   end
 end
 
-# A reader blocked on a pipe a lingering process still holds will never see
-# EOF, so the drain is bounded and the pipes are then closed under the readers
-# rather than waited on.
 def stop_readers(readers, streams)
   deadline = monotonic_now() + READER_DRAIN_TIMEOUT
   readers.each do |reader|
@@ -240,7 +182,6 @@ def stop_readers(readers, streams)
   readers.each { |reader| reader.kill if reader.join(KILL_GRACE_TIMEOUT) == nil }
 end
 
-# A stuck scan must never hang the build, so the whole process group goes down.
 def kill_process_group(pid)
   return unless signal_process_group(pid, "TERM")
 
@@ -254,9 +195,6 @@ def kill_process_group(pid)
   signal_process_group(pid, "KILL")
 end
 
-# Signal 0 asks whether the group is still there. Returns false when it is
-# gone, or when this process is not allowed to signal it, in which case there
-# is nothing further to escalate to.
 def signal_process_group(pid, signal)
   begin
     Process.kill(signal, -pid)
@@ -282,8 +220,6 @@ def get_source_path()
   return source_path
 end
 
-# Every enumerated input is read the same way: the value is lower cased and
-# has to be one of the options the step form offers.
 def get_enum_input(key, default, allowed, label)
   value = env_default(key, default).downcase
   unless allowed.include?(value)
@@ -293,10 +229,6 @@ def get_enum_input(key, default, allowed, label)
   return value
 end
 
-# String#to_i stops at the first character it cannot read, so `15m` would
-# quietly become 15 seconds and `1e3` one second. A timeout that means
-# something other than what was typed is worse than a rejected input, so the
-# whole value has to be digits.
 def get_positive_number_input(key, default, label)
   configured = env_default(key, "#{default}")
   number = configured.to_i
@@ -327,9 +259,6 @@ def get_scan_timeout()
   return get_positive_number_input("AC_MOBSFSCAN_TIMEOUT", DEFAULT_SCAN_TIMEOUT, "timeout")
 end
 
-# MobSF grades out of 100. 0 is the default and leaves the gate off: no report
-# can score below it. Only the advance scan produces a score at all, so a light
-# scan has nothing to compare against whatever is set here.
 def get_minimum_score()
   configured = env_default("AC_MOBSFSCAN_MIN_SCORE", "#{DEFAULT_MINIMUM_SCORE}")
   score = configured.to_i
@@ -362,8 +291,6 @@ def get_output_formats()
   return formats
 end
 
-# When the config input is empty, mobsfscan discovers a `.mobsf` file at the
-# scan root on its own, so -c is deliberately not passed.
 def get_config_path(source_path)
   configured = env_default("AC_MOBSFSCAN_CONFIG_PATH", nil)
   return nil if configured == nil
@@ -381,8 +308,6 @@ def get_config_path(source_path)
   return config_path
 end
 
-# Free form parameters are split with shell word rules and passed as separate
-# argv entries, they are never re-evaluated by a shell.
 def get_extra_parameters()
   extra = env_default("AC_MOBSFSCAN_EXTRA_PARAMETERS", nil)
   return [] if extra == nil
@@ -415,10 +340,6 @@ def get_python_executable()
   return "python3"
 end
 
-# The virtualenv is isolated on purpose: a global or --user install is rejected
-# by PEP 668 managed interpreters on macOS runners, and inside the Android
-# container the step runs as root, where it would leak into the pinned runner
-# toolchain. AC_STEP_TEMP is discarded when the step ends, so there is no cleanup.
 def create_virtualenv(python, venv_path)
   FileUtils.rm_rf(venv_path)
   stdout_str, stderr_str, exit_code = run_command([python, "-m", "venv", venv_path], true, VENV_TIMEOUT)
@@ -430,8 +351,6 @@ def create_virtualenv(python, venv_path)
   return venv_path
 end
 
-# mobsfscan shells out to `semgrep`, so the virtualenv's bin directory has to be
-# on PATH for the pattern matching rules to run at all.
 def venv_environment(venv_path)
   return {
     "PATH" => "#{venv_path}/bin#{File::PATH_SEPARATOR}#{ENV["PATH"]}",
@@ -472,7 +391,6 @@ def install_mobsfscan(venv_path, version)
   stdout_str, stderr_str, exit_code = run_command(command, true, INSTALL_TIMEOUT, venv_environment(venv_path))
 
   unless exit_code == 0
-    # pip echoes the index URL back on failure, so the message is masked too.
     message = get_install_failure_message(version, "#{stdout_str}#{stderr_str}")
     abort_script(mask_secrets("#{message}\n#{stderr_str}"))
   end
@@ -480,8 +398,6 @@ def install_mobsfscan(venv_path, version)
   verify_installed_version(venv_path, version)
 end
 
-# `mobsfscan --version` writes through its logger, so the version lands on
-# stderr rather than stdout.
 def verify_installed_version(venv_path, requested)
   stdout_str, stderr_str, exit_code = run_command(["#{venv_path}/bin/mobsfscan", "--version"], true,
                                                   VERSION_TIMEOUT, venv_environment(venv_path))
@@ -493,10 +409,6 @@ def verify_installed_version(venv_path, requested)
 end
 
 ###### Light Scan Logging
-# The light scan is the default, so its log is written to be read top to
-# bottom: what is about to be scanned, then one numbered line per stage, then
-# the summary. Without it the log opens on pip output and a user cannot tell
-# which mode ran or what it was pointed at.
 LIGHT_SCAN_STAGES = 3
 
 def print_stage(number, title)
@@ -531,9 +443,6 @@ def get_scan_command(format, output_file)
     command.push($config_path)
   end
 
-  # The step decides success or failure by parsing the JSON report, so the tool
-  # is told never to fail. A non zero exit code then means mobsfscan itself
-  # broke, not that it found something.
   command.push("--no-fail")
   command.concat($extra_parameters)
   command.push($source_path)
@@ -566,8 +475,6 @@ def parse_report(path)
   end
 end
 
-# A silently semgrep-less install reports only best practice rules, which would
-# otherwise look like a clean project.
 def check_scan_errors(report)
   errors = report["errors"] != nil ? report["errors"] : []
   return if errors.empty?
@@ -579,8 +486,6 @@ def check_scan_errors(report)
                "ran. This is an installation problem, not a clean scan result.")
 end
 
-# File level matches and "missing best practice" rules are counted separately:
-# best practice rules carry no file location and always report on a project.
 def summarize_report(report)
   findings = new_severity_counter()
   best_practices = new_severity_counter()
@@ -611,8 +516,6 @@ def bucket_length(appsec, bucket)
   return appsec[bucket] != nil ? appsec[bucket].length : 0
 end
 
-# Both modes report through the same shape, so the console summary, the
-# threshold gate and the step outputs are shared.
 def build_summary(findings, best_practices)
   totals = {}
   total = 0
@@ -662,8 +565,6 @@ def print_summary(title, summary, threshold, minimum_score, failure)
   puts "------------------------------------------------------"
 end
 
-# 0 is the default and means the gate is off, which the summary says rather
-# than printing a number that never applies.
 def get_minimum_score_label(summary, minimum_score)
   return "0 (no score gate)" if minimum_score == nil || minimum_score == 0
   return "#{minimum_score} (the light scan reports no score, not checked)" if summary[:security_score] == nil
@@ -671,9 +572,6 @@ def get_minimum_score_label(summary, minimum_score)
   return "#{minimum_score}"
 end
 
-# Fails the build when the report holds a finding at or above the selected
-# level, so picking `low` is the strictest setting and `critical` the loosest.
-# A stricter selection can never let a worse finding through.
 def is_threshold_exceeded(summary, threshold)
   return false if threshold == "none"
 
@@ -684,11 +582,6 @@ def is_threshold_exceeded(summary, threshold)
   return SEVERITIES.any? { |severity| SEVERITY_RANK[severity] >= minimum && summary[:totals][severity] > 0 }
 end
 
-# The level gate and the score gate are independent, and both are evaluated on
-# every run: the first reads the findings, the second reads the MobSF score.
-# Either one on its own breaks the pipeline, so a `none` level still leaves the
-# score gate in force, and a score above the minimum does not excuse a finding.
-# Returns the reason, or nil when the pipeline continues.
 def get_gate_failure(summary, threshold, minimum_score, tool)
   if minimum_score != nil && summary[:security_score] != nil &&
      summary[:security_score] < minimum_score
@@ -701,9 +594,6 @@ def get_gate_failure(summary, threshold, minimum_score, tool)
 end
 
 ###### Report Publishing & Environment Variables
-# The reports land directly in AC_OUTPUT_DIR under their own names, neither in
-# a subfolder nor archived, so Export Build Artifacts publishes each file as it
-# is.
 def copy_reports(report_path, filenames)
   if $output_path == nil
     puts "@@[warning] AC_OUTPUT_DIR is not set, the reports are not published as artifacts."
@@ -741,8 +631,6 @@ def write_environment_variables(values)
   end
 end
 
-# Both modes finish the same way: print the summary, publish the reports,
-# export the outputs and apply the two gates. Never returns.
 def publish_and_finish(mode, summary, filenames)
   advance = mode == "advance"
   tool = advance ? "MobSF" : "mobsfscan"
@@ -769,8 +657,6 @@ def publish_and_finish(mode, summary, filenames)
   exit 0
 end
 
-# No report path is exported: the reports are published into AC_OUTPUT_DIR
-# under a fixed name, so a following step already knows where to find them.
 def get_step_outputs(summary)
   return {
     "AC_MOBSFSCAN_FINDING_COUNT" => summary[:total],
@@ -799,9 +685,6 @@ $scan_mode = get_scan_mode()
 FileUtils.mkdir_p($step_temp)
 FileUtils.mkdir_p($report_path)
 
-### Advance mode uses the MobSF installation provisioned on the runner and
-### scans a zip of the source, falling back to the light scan whenever the
-### runner cannot serve it.
 if $scan_mode == "advance"
   $advance_summary = try_advance_scan()
   publish_and_finish("advance", $advance_summary, [MOBSF_REPORT_FILENAME]) if $advance_summary != nil
@@ -814,8 +697,6 @@ print_stage(1, "Installing the scanner")
 create_virtualenv(get_python_executable(), $venv_path)
 install_mobsfscan($venv_path, $mobsfscan_version)
 
-### JSON is always produced, it is the report the gate decision is made from.
-### It is only published as an artifact when the user asked for it.
 print_stage(2, "Scanning the source code")
 scan_formats = ["json"]
 $output_formats.each { |format| scan_formats.push(format) unless scan_formats.include?(format) }
