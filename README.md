@@ -39,15 +39,19 @@ from the runner.
   map onto what the engines report: `critical` is mobsfscan `ERROR` and MobSF `high`, `normal` is
   `WARNING` / `warning`, `low` is `INFO` / `info`. MobSF `secure` and `hotspot` entries never
   break the pipeline.
-- `AC_MOBSFSCAN_MIN_SCORE`: Minimum Security Score. Breaks the pipeline when MobSF's score out
-  of 100 falls below this. Empty (default) disables the check. Only the **advance** scan reports
+- `AC_MOBSFSCAN_MIN_SCORE`: Fail Build Minimum Security Score. Breaks the pipeline when MobSF's
+  score out of 100 falls below this. `0`, the default, leaves the gate off, since no report can
+  score below it. Only the **advance** scan reports
   a score; a light scan has nothing to compare against, so the check is skipped and the summary
   says so. See [The two gates](#the-two-gates).
 - `AC_MOBSFSCAN_CONFIG_PATH`: Config File Path. Path of the `.mobsf` config for rule tuning.
   When empty, a `.mobsf` file at the scan root is picked up automatically.
 - `AC_MOBSFSCAN_SAVE_REPORT`: Save Report. Copies the reports into the artifacts folder when
   `true` (default).
-- `AC_MOBSFSCAN_TIMEOUT`: Scan Timeout. Seconds for a single mobsfscan run, default `900`.
+- `AC_MOBSFSCAN_TIMEOUT`: Scan Timeout. Seconds for a single mobsfscan run, default `900`. A
+  whole number of seconds: a value like `15m` is rejected rather than read as 15 seconds. A
+  command that hits its timeout is terminated together with everything it started, and the step
+  never waits longer than the timeout for it, whatever the command left running behind it.
 - `AC_MOBSFSCAN_ADVANCE_TIMEOUT`: Advance Scan Timeout. Seconds for the MobSF scan, default
   `1800`.
 - `AC_MOBSFSCAN_EXTRA_PARAMETERS`: Scanner Parameters. Extra mobsfscan parameters, split with
@@ -60,7 +64,7 @@ Two independent gates decide the build, and **both are evaluated on every scan**
 | Gate | Input | Reads |
 | --- | --- | --- |
 | Level gate | `AC_MOBSFSCAN_SEVERITY_THRESHOLD` (Fail Build On) | the findings |
-| Score gate | `AC_MOBSFSCAN_MIN_SCORE` (Minimum Security Score) | the MobSF score out of 100 |
+| Score gate | `AC_MOBSFSCAN_MIN_SCORE` (Fail Build Minimum Security Score) | the MobSF score out of 100 |
 
 They are not chained, so neither one gates the other:
 
@@ -71,8 +75,9 @@ They are not chained, so neither one gates the other:
 - A score comfortably above the minimum does not excuse a finding at or above the selected level,
   and a clean level gate does not excuse a low score.
 - The score gate is skipped when the report carries no score, which is every **light** scan.
-  Setting Minimum Security Score without switching to `advance` therefore changes nothing, and
-  the summary line says so.
+  Setting Fail Build Minimum Security Score without switching to `advance` therefore changes
+  nothing, and the summary line says so.
+- `0`, the default, leaves the score gate off and lets the level gate decide alone.
 
 Whichever gate breaks the build, the reports are published first, so the findings stay
 downloadable on the failing path.
@@ -131,7 +136,7 @@ MobSF Source Code Scan Summary - light scan
   Total                 10 finding(s)
   Worst level found     Critical
   Fail build on         critical
-  Minimum score         not set
+  Minimum score         0 (no score gate)
   Verdict               pipeline breaks
 ------------------------------------------------------
 ```

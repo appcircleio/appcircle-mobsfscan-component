@@ -11,6 +11,7 @@ DEFAULT_MOBSFSCAN_VERSION = "1.0.0"
 DEFAULT_OUTPUT_FORMATS = "sarif"
 DEFAULT_SCAN_TYPE = "auto"
 DEFAULT_SEVERITY_THRESHOLD = "critical"
+DEFAULT_MINIMUM_SCORE = 0
 DEFAULT_SCAN_TIMEOUT = 900
 INSTALL_TIMEOUT = 1800
 VENV_TIMEOUT = 300
@@ -131,35 +132,77 @@ def mask_secrets(text)
 end
 
 ###### Run Command Function
+# Once the command is gone, everything it wrote is already sitting in the pipe
+# buffer, which a reader consumes in microseconds, so this grace period is only
+# ever spent when something that outlived the command still holds the write
+# end. Two seconds is orders of magnitude more than draining needs and short
+# enough not to be felt. In the normal case a reader sees EOF the moment the
+# command exits and none of it is spent.
+READER_DRAIN_TIMEOUT = 2
+
+# Only spent when the process survived a TERM and a KILL.
+REAP_TIMEOUT = 10
+
+# TERM first so a command can clean up after itself, then KILL. The wait
+# between the two is polled rather than slept through, so a command that stops
+# on TERM does not add its full grace period to every timeout.
+KILL_GRACE_TIMEOUT = 3
+KILL_POLL_INTERVAL = 0.1
+
+def monotonic_now()
+  return Process.clock_gettime(Process::CLOCK_MONOTONIC)
+end
+
 # The command is an argv array and is never handed to a shell, so user supplied
 # paths and free form parameters cannot be reinterpreted as shell syntax.
 # Returns stdout, stderr and the exit code.
+#
+# Every wait in here is bounded, because the step's timeout is all that stands
+# between a stuck scan and a build that hangs until the runner's own limit ends
+# it. The timeout used to cover the wait for the process only: the readers were
+# joined afterwards with no bound at all, and a reader sees EOF only once every
+# copy of the pipe's write end is closed. A command that leaves a background
+# process behind hands one of those copies to it, so the step waited on the
+# background process rather than on the command, the timeout never fired, and
+# the command was reported as successful however long that took. That is the
+# unstable part: whether the timeout worked depended on whether the command
+# happened to spawn something that outlived it.
 def run_command(command, skip_abort, timeout = nil, environment = {})
   puts "@@[command] #{mask_secrets(command.shelljoin)}"
 
   stdout_str = ""
   stderr_str = ""
-  status = nil
 
   begin
-    Open3.popen3(environment, *command, :pgroup => true) do |stdin, stdout, stderr, wait_thr|
-      stdin.close
-      readers = [
-        Thread.new { stdout.each_line { |line| stdout_str += line } },
-        Thread.new { stderr.each_line { |line| stderr_str += line } }
-      ]
-
-      if timeout != nil && wait_thr.join(timeout) == nil
-        kill_process_group(wait_thr.pid)
-        readers.each { |reader| reader.kill }
-        abort_script("`#{File.basename(command[0])}` exceeded the #{timeout} second timeout and was terminated.")
-      end
-
-      readers.each { |reader| reader.join }
-      status = wait_thr.value
-    end
+    stdin, stdout, stderr, wait_thr = Open3.popen3(environment, *command, :pgroup => true)
   rescue Errno::ENOENT
     abort_script("#{command[0]} was not found on this runner.")
+  end
+
+  # popen3's own block form is deliberately not used: its ensure joins the wait
+  # thread with no bound, which reintroduces the unbounded wait this function
+  # exists to avoid.
+  begin
+    stdin.close
+    readers = [read_stream(stdout, stdout_str), read_stream(stderr, stderr_str)]
+
+    timed_out = wait_thr.join(timeout) == nil
+    kill_process_group(wait_thr.pid) if timed_out
+    stop_readers(readers, [stdout, stderr])
+    status = wait_thr.join(REAP_TIMEOUT) != nil ? wait_thr.value : nil
+  ensure
+    [stdout, stderr].each { |io| io.close unless io.closed? }
+  end
+
+  if timed_out
+    abort_script("`#{File.basename(command[0])}` exceeded the #{timeout} second timeout and was terminated.")
+  end
+
+  # Only reachable when the process outlived a TERM and a KILL, which means the
+  # step cannot know how it ended and must not guess.
+  if status == nil
+    abort_script("`#{File.basename(command[0])}` could not be terminated on this runner and did " \
+                 "not report an exit code.")
   end
 
   unless status.success?
@@ -169,14 +212,57 @@ def run_command(command, skip_abort, timeout = nil, environment = {})
   return stdout_str, stderr_str, status.exitstatus
 end
 
+# The buffer is appended to in place, so the caller keeps whatever arrived even
+# when the pipe is closed under the thread.
+def read_stream(io, buffer)
+  return Thread.new do
+    begin
+      io.each_line { |line| buffer << line }
+    rescue IOError, Errno::EBADF
+      # The pipe was closed from under this thread because a process that
+      # outlived the command still held its own copy of the write end.
+    end
+  end
+end
+
+# A reader blocked on a pipe a lingering process still holds will never see
+# EOF, so the drain is bounded and the pipes are then closed under the readers
+# rather than waited on.
+def stop_readers(readers, streams)
+  deadline = monotonic_now() + READER_DRAIN_TIMEOUT
+  readers.each do |reader|
+    remaining = deadline - monotonic_now()
+    reader.join(remaining > 0 ? remaining : 0)
+  end
+  return if readers.none? { |reader| reader.alive? }
+
+  streams.each { |io| io.close unless io.closed? }
+  readers.each { |reader| reader.kill if reader.join(KILL_GRACE_TIMEOUT) == nil }
+end
+
 # A stuck scan must never hang the build, so the whole process group goes down.
 def kill_process_group(pid)
+  return unless signal_process_group(pid, "TERM")
+
+  deadline = monotonic_now() + KILL_GRACE_TIMEOUT
+  while monotonic_now() < deadline
+    return unless signal_process_group(pid, 0)
+
+    sleep KILL_POLL_INTERVAL
+  end
+
+  signal_process_group(pid, "KILL")
+end
+
+# Signal 0 asks whether the group is still there. Returns false when it is
+# gone, or when this process is not allowed to signal it, in which case there
+# is nothing further to escalate to.
+def signal_process_group(pid, signal)
   begin
-    Process.kill("TERM", -pid)
-    sleep 3
-    Process.kill("KILL", -pid)
+    Process.kill(signal, -pid)
+    return true
   rescue Errno::ESRCH, Errno::EPERM
-    return
+    return false
   end
 end
 
@@ -207,11 +293,15 @@ def get_enum_input(key, default, allowed, label)
   return value
 end
 
+# String#to_i stops at the first character it cannot read, so `15m` would
+# quietly become 15 seconds and `1e3` one second. A timeout that means
+# something other than what was typed is worse than a rejected input, so the
+# whole value has to be digits.
 def get_positive_number_input(key, default, label)
   configured = env_default(key, "#{default}")
   number = configured.to_i
-  unless number > 0
-    abort_script("Invalid #{label} `#{configured}`. A positive number of seconds is expected.")
+  unless configured =~ /\A\d+\z/ && number > 0
+    abort_script("Invalid #{label} `#{configured}`. A positive whole number of seconds is expected.")
   end
 
   return number
@@ -237,15 +327,15 @@ def get_scan_timeout()
   return get_positive_number_input("AC_MOBSFSCAN_TIMEOUT", DEFAULT_SCAN_TIMEOUT, "timeout")
 end
 
-# Empty means no score gate. Only the advance scan produces a score, MobSF
-# grades out of 100, so a light scan has nothing to compare against.
+# MobSF grades out of 100. 0 is the default and leaves the gate off: no report
+# can score below it. Only the advance scan produces a score at all, so a light
+# scan has nothing to compare against whatever is set here.
 def get_minimum_score()
-  configured = env_default("AC_MOBSFSCAN_MIN_SCORE", nil)
-  return nil if configured == nil
-
+  configured = env_default("AC_MOBSFSCAN_MIN_SCORE", "#{DEFAULT_MINIMUM_SCORE}")
   score = configured.to_i
   unless configured =~ /\A\d+\z/ && score <= 100
-    abort_script("Invalid minimum security score `#{configured}`. A number between 0 and 100 is expected.")
+    abort_script("Invalid minimum security score `#{configured}`. A whole number between 0 and 100 " \
+                 "is expected.")
   end
 
   return score
@@ -425,7 +515,7 @@ def print_light_scan_plan()
                      "`.mobsf` at the scan root, when present")
   print_summary_line("Fail build on", $severity_threshold == "none" ? "none (report only)" :
                      $severity_threshold)
-  if $minimum_score != nil
+  if $minimum_score > 0
     print_summary_line("Minimum score", "#{$minimum_score} (advance scan only, not checked here)")
   end
   puts "------------------------------------------------------"
@@ -572,8 +662,10 @@ def print_summary(title, summary, threshold, minimum_score, failure)
   puts "------------------------------------------------------"
 end
 
+# 0 is the default and means the gate is off, which the summary says rather
+# than printing a number that never applies.
 def get_minimum_score_label(summary, minimum_score)
-  return "not set" if minimum_score == nil
+  return "0 (no score gate)" if minimum_score == nil || minimum_score == 0
   return "#{minimum_score} (the light scan reports no score, not checked)" if summary[:security_score] == nil
 
   return "#{minimum_score}"
@@ -698,6 +790,7 @@ $scan_type = get_scan_type()
 $severity_threshold = get_severity_threshold()
 $output_formats = get_output_formats()
 $scan_timeout = get_scan_timeout()
+$advance_timeout = get_advance_timeout()
 $minimum_score = get_minimum_score()
 $config_path = get_config_path($source_path)
 $extra_parameters = get_extra_parameters()

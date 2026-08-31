@@ -470,11 +470,74 @@ RSpec.describe '#run_command' do
     end
   end
 
+  context 'positive path – output larger than the pipe buffer' do
+    # The readers exist so a command cannot deadlock on a full pipe, and the
+    # bounded drain must not cost any of that output.
+    it 'captures every line' do
+      stdout_str = nil
+      capture_stdout do
+        stdout_str, = run_command(['sh', '-c', 'i=0; while [ $i -lt 20000 ]; do ' \
+                                   'echo "line $i"; i=$((i+1)); done'], true, 60)
+      end
+      expect(stdout_str.lines.length).to eq(20_000)
+      expect(stdout_str.lines.last.strip).to eq('line 19999')
+    end
+  end
+
   context 'negative path – timeout exceeded' do
     it 'terminates the command so a stuck scan cannot hang the build' do
       message = nil
       capture_stdout { message = capture_abort { run_command(%w[sleep 30], true, 1) } }
       expect(message).to include('exceeded the 1 second timeout')
+    end
+
+    # The kill used to sleep through its grace period whether or not the
+    # command had already stopped, so every timeout fired late by that much.
+    it 'fires at the timeout rather than after the kill grace period' do
+      elapsed = nil
+      capture_stdout do
+        capture_abort do
+          started = monotonic_now()
+          run_command(%w[sleep 30], true, 1)
+        ensure
+          elapsed = monotonic_now() - started
+        end
+      end
+      expect(elapsed).to be < 2.5
+    end
+
+    # The one that made the timeout look unstable. The command exits inside its
+    # timeout but leaves a background process holding the write end of the
+    # pipe, so the readers never see EOF. They used to be joined with no bound,
+    # which meant the step waited on the background process, the timeout never
+    # fired, and the command was reported as successful however long it took.
+    it 'does not wait on a background process that outlived the command' do
+      stdout_str = nil
+      exit_code = nil
+      elapsed = nil
+      capture_stdout do
+        started = monotonic_now()
+        stdout_str, _stderr_str, exit_code = run_command(
+          ['sh', '-c', 'sleep 30 & echo started'], true, 2)
+        elapsed = monotonic_now() - started
+      end
+      expect(elapsed).to be < 5
+      expect(stdout_str.strip).to eq('started')
+      expect(exit_code).to eq(0)
+    end
+
+    # A command that ignores TERM has to be escalated to KILL, and that is the
+    # only case where the grace period is genuinely spent.
+    it 'escalates to KILL when the command ignores TERM' do
+      message = nil
+      elapsed = nil
+      capture_stdout do
+        started = monotonic_now()
+        message = capture_abort { run_command(['sh', '-c', 'trap "" TERM; sleep 30'], true, 1) }
+        elapsed = monotonic_now() - started
+      end
+      expect(message).to include('exceeded the 1 second timeout')
+      expect(elapsed).to be < 10
     end
   end
 end
@@ -638,6 +701,18 @@ RSpec.describe '#get_scan_timeout' do
 
     it 'aborts on a non-numeric value' do
       ENV['AC_MOBSFSCAN_TIMEOUT'] = 'soon'
+      expect { get_scan_timeout }.to raise_error(SystemExit)
+    end
+
+    # String#to_i stops at the first character it cannot read, so these used to
+    # be accepted as 15 and 1 second rather than rejected.
+    it 'aborts on a value with a unit suffix instead of reading 15 seconds' do
+      ENV['AC_MOBSFSCAN_TIMEOUT'] = '15m'
+      expect { get_scan_timeout }.to raise_error(SystemExit)
+    end
+
+    it 'aborts on exponent notation instead of reading 1 second' do
+      ENV['AC_MOBSFSCAN_TIMEOUT'] = '1e3'
       expect { get_scan_timeout }.to raise_error(SystemExit)
     end
   end
@@ -1013,8 +1088,9 @@ RSpec.describe '#get_minimum_score' do
   after { reset_inputs }
 
   context 'positive path' do
-    it 'defaults to no score gate' do
-      expect(get_minimum_score()).to be_nil
+    # 0 is the default and leaves the gate off: no report can score below it.
+    it 'defaults to 0' do
+      expect(get_minimum_score()).to eq(0)
     end
 
     it 'reads a configured score' do
@@ -1022,9 +1098,9 @@ RSpec.describe '#get_minimum_score' do
       expect(get_minimum_score()).to eq(45)
     end
 
-    it 'accepts zero' do
-      ENV['AC_MOBSFSCAN_MIN_SCORE'] = '0'
-      expect(get_minimum_score()).to eq(0)
+    it 'reads 100 as the strictest gate' do
+      ENV['AC_MOBSFSCAN_MIN_SCORE'] = '100'
+      expect(get_minimum_score()).to eq(100)
     end
   end
 
@@ -1036,6 +1112,17 @@ RSpec.describe '#get_minimum_score' do
 
     it 'rejects a non-numeric score' do
       ENV['AC_MOBSFSCAN_MIN_SCORE'] = 'high'
+      expect(capture_abort { get_minimum_score() }).to include('between 0 and 100')
+    end
+
+    # to_i would read these as 45 and 1 rather than rejecting them.
+    it 'rejects a fractional score' do
+      ENV['AC_MOBSFSCAN_MIN_SCORE'] = '45.5'
+      expect(capture_abort { get_minimum_score() }).to include('between 0 and 100')
+    end
+
+    it 'rejects exponent notation' do
+      ENV['AC_MOBSFSCAN_MIN_SCORE'] = '1e2'
       expect(capture_abort { get_minimum_score() }).to include('between 0 and 100')
     end
   end
@@ -1050,12 +1137,17 @@ RSpec.describe '#get_gate_failure' do
   let(:scored) { summarize_mobsf_report('appsec' => { 'security_score' => 30, 'warning' => [{}] }) }
 
   context 'positive path – pipeline continues' do
-    it 'passes a clean report with no score gate' do
-      expect(get_gate_failure(clean, 'low', nil, 'mobsfscan')).to be_nil
+    it 'passes a clean report with the score gate at its default' do
+      expect(get_gate_failure(clean, 'low', 0, 'mobsfscan')).to be_nil
     end
 
     it 'passes a score at the minimum' do
       expect(get_gate_failure(scored, 'none', 30, 'MobSF')).to be_nil
+    end
+
+    # The default gate of 0 cannot be breached, whatever the report scored.
+    it 'passes any score when the gate is 0' do
+      expect(get_gate_failure(scored, 'none', 0, 'MobSF')).to be_nil
     end
 
     # The light scan reports no score, so the score gate has nothing to read.
@@ -1066,7 +1158,7 @@ RSpec.describe '#get_gate_failure' do
 
   context 'negative path – pipeline breaks' do
     it 'breaks on the level gate' do
-      expect(get_gate_failure(with_error, 'critical', nil, 'mobsfscan'))
+      expect(get_gate_failure(with_error, 'critical', 0, 'mobsfscan'))
         .to include('`critical` finding or worse')
     end
 
