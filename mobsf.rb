@@ -12,6 +12,17 @@
 ###### Advance Mode Defaults & Constants
 DEFAULT_ADVANCE_TIMEOUT = 1800
 
+# The control script is given the scan timeout and enforces it itself, so the
+# step's own bound on the script sits just above it. Without the margin the two
+# race, and which one fires first decides whether the build sees the script's
+# own message or a bare timeout.
+CONTROL_TIMEOUT_MARGIN = 60
+
+# Archiving is bounded separately from the scan: a large repository is slow to
+# zip but that is not a stuck scan. It used to borrow VENV_TIMEOUT, which said
+# nothing about what was being waited for.
+ARCHIVE_TIMEOUT = 900
+
 # Provisioning (PL-398) puts MobSF here: macOS first, then Linux.
 DEFAULT_MOBSF_PREFIXES = ["/usr/local/appcircle/mobsf", "/opt/appcircle/mobsf"]
 MOBSF_MANIFEST_FILE = "appcircle-mobsf-manifest.json"
@@ -183,7 +194,7 @@ def create_source_zip(source_path, zip_path)
   end
 
   stdout_str, stderr_str, exit_code = run_command(
-    ["python3", script_path, source_path, zip_path, ZIP_EXCLUDE_DIRS.join(",")], true, VENV_TIMEOUT)
+    ["python3", script_path, source_path, zip_path, ZIP_EXCLUDE_DIRS.join(",")], true, ARCHIVE_TIMEOUT)
 
   unless exit_code == 0
     abort_script("The source code could not be archived for MobSF.\n#{stderr_str}")
@@ -279,8 +290,9 @@ def run_advance_scan(prefix, control_script, report_path)
   zip_path = "#{$step_temp}/#{SOURCE_ZIP_FILENAME}"
   create_source_zip($source_path, zip_path)
 
-  command = get_advance_scan_command(control_script, prefix, zip_path, report_path, get_advance_timeout())
-  stdout_str, stderr_str, exit_code = run_command(command, true, get_advance_timeout() + 60)
+  command = get_advance_scan_command(control_script, prefix, zip_path, report_path, $advance_timeout)
+  stdout_str, stderr_str, exit_code = run_command(command, true,
+                                                 $advance_timeout + CONTROL_TIMEOUT_MARGIN)
   puts stdout_str unless stdout_str.strip.empty?
 
   unless exit_code == 0
